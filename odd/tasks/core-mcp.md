@@ -78,7 +78,7 @@ Quotes are VERBATIM from docs/PRD.md v1.10 — the RF text is the spec; never pa
 | T7 | S4 | FTS5 v3 (v1.11 fields) + CatalogRepo + 3 usecases + 3 tools + 5 riders db + wiring | (este PR) |
 | T8 | S5 | Tickets core: dto + 5 usecases double RBAC + TicketsRepo + corrección PII (R3-mask-split-run) | 59b73f9 + 24894ac (PR #27 → d2ad761) |
 | T8b | S5 | Transport: 5 tools role-gated + wiring + transport E2E | (este PR) |
-| T9 | S6,S7 | Skill template (doctrina resolutiva) + doc de pairing (WA verificado + verificación e-mail) | (pend) |
+| T9 | S6,S7 | Skill recepcionista (doctrina resolutiva) + pairing doc (WA verificado, e-mail a verificar) | 1ad5cb4 |
 | T10 | S8 | Tests de volumen (10k sintéticos) + demo reproducible + cierre F1 (DoD) | (pend) |
 
 ## Log
