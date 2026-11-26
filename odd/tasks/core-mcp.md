@@ -72,7 +72,7 @@ Quotes are VERBATIM from docs/PRD.md v1.10 — the RF text is the spec; never pa
 | T1 | S8 | Go module + cmd/server mínimo + .golangci.yml + ci.yml; pipeline verde; RDD; PR; ruleset += ci | 58e02d1 (PR #8 → 677a7d1) |
 | T2 | S1 | /mcp POST-only 405 + ErrServerClosed fix + boundary tests + rider docs | (este PR) |
 | T3 | S2 | internal/auth — CallerResolver §3.8 fail-closed, port anti-inyección, sentinels para T6 | 1999079 |
-| T4 | S2,S3 | SQLite db layer (modernc, WAL, busy_timeout, FK ON) + schema base §3.7: accounts, clients, business_profile, catalog_items, ticket_type fijo, tickets, ticket_events | (pend) |
+| T4 | S2,S3 | SQLite db layer + migration runner append-only + F1 schema (option B) + CallerLookup adapter | (este PR) |
 | T5 | S3 | register_client seam anónima + rate-limit por identificador + colisiones fail-closed + alerta posible-duplicado | (pend) |
 | T6 | S2 | Servidor MCP Streamable HTTP (go-sdk) + JSON-RPC errors (-32000/-32002/-32603) + tools/list filtrado por rol | (pend) |
 | T7 | S4 | catalog_items + search_catalog (FTS5) | (pend) |
@@ -112,3 +112,17 @@ Quotes are VERBATIM from docs/PRD.md v1.10 — the RF text is the spec; never pa
   único cohesivo — partirlo fragmentaría tests que referencian el paquete entero);
   boundary registrado acá per ODD. Issue #13; PR con rider backlog (advisories T2 +
   decisiones CallerError→domain para T4/T6).
+- L7 (2026-11-26, v1.11): pre-T4 el owner aprobó conocimiento de catálogo orientado
+  al agente — catalog_items gana use_cases y limitations (PRD v1.11, PR #16 → 07ecd67,
+  assess passive + readback).
+- L8 (2026-11-26, T4): owner eligió scope B (F1-only + migration runner append-only).
+  DELEGADO a gentle-ai-worker: internal/db (Open con pragmas DSN, MCP_DB_PATH
+  fail-closed, runner versionado con rechazo de huecos, schema F1 v1+v2 con seed
+  'consulta') + internal/repository (CallerLookup adapter, accounts-first, guard de
+  ambigüedad, is_active estricto) + E2E resolver+SQLite. ~880 prod + ~1130 test líneas.
+  Desviaciones de calidad aceptadas: price_cents INTEGER (dinero sin float), índice
+  unique lower(email) en accounts, ticket_events AUTOINCREMENT (audit append-only),
+  deferrals documentados por fase. Fixes del orquestador: doc del port auth alineado
+  a §3.8 accounts-first, misspell += producto (nolint del worker dropeado). SLICE:
+  un solo commit (unidad schema+migración+adapter inseparable); boundary registrado.
+  Issue #17; PR con rider backlog (6 advisories T3 + fixes).
