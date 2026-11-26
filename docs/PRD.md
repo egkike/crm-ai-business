@@ -1,8 +1,8 @@
 # PRD: CRM-AI-Business
 
-> **Estado**: Aprobado (owner, 2026-11-26) — ronda de revisiones T1–T7 cerrada
+> **Estado**: Aprobado (owner, 2026-11-26) — revisión v1.11 en curso
 > **Owner**: Kike
-> **Versión**: 1.10
+> **Versión**: 1.11
 > **Última actualización**: 2026-11-26
 
 ---
@@ -257,7 +257,7 @@ Esquema definitivo por feature ODD de la fase; la forma canónica acordada:
 | `areas` | Áreas de atención configurables | nombre, staff miembros (N:M con `accounts`) |
 | `clients` | Clientes finales | `id` = **UUID interno** (FKs estables ante cambios y merges), `phone` **UNIQUE nullable** (verbatim del canal WhatsApp), `email` **UNIQUE nullable** sobre `lower(email)`, `display_name`, notas, `default_address` opcional + `default_lat`/`default_lng` nullable (ubicación compartida por WhatsApp; la live location nunca se almacena). Registro por canal: WhatsApp-first crea con `phone`; e-mail-first crea con `email` |
 | `business_profile` | Perfil del negocio | nombre, descripción, canales (`messenger_platform`, `messenger_id`), **`phone` (llamadas, distinto del `messenger_id`) + `email` + `website_url` + `social_links` (mapa red→URL, ej. Instagram/Facebook) — datos de contacto y web que Hermes comparte al Cliente que los pide**, **`address` + `lat`/`lng` opcionales + `maps_url`** (ubicación compartible: Hermes la pasa al Cliente que la pide, conduciendo hacia el turno), `online_store_url` opcional (fallback de venta online), `default_delivery_min` opcional (ventana de duración para delivery), config de fidelización (umbral de inactividad, umbral de seguimiento de leads) |
-| `catalog_items` | Catálogo unificado | `kind` (producto\|servicio), nombre, descripción, precio, `sales_url` nullable (deep-link de compra online), `duration_min` solo para servicios (reservables) |
+| `catalog_items` | Catálogo unificado | `kind` (producto\|servicio), nombre, `description` (qué es, corto), `use_cases` **nullable** (qué problemas resuelve, para quién — alimenta el `[RESULTADO]` de RF23 y el FTS), `limitations` **nullable** (qué NO cubre — honestidad pre-venta), precio, `sales_url` nullable (deep-link de compra online), `duration_min` solo para servicios (reservables) |
 | `schedules` / `hours_exceptions` | Horarios semanales y excepciones de staff agendable | por `account_id` bookable |
 | `bookings` | Reservas | client + staff agendable + datetime + estado (activa/cancelada/reprogramada); `kind` (servicio\|domicilio\|delivery) + `address` (obligatoria en domicilio/delivery) + `lat`/`lng` opcionales (congeladas de la ubicación del Cliente); duración: del servicio del catálogo (servicio/domicilio) o `default_delivery_min` (delivery, ítem vendido como contexto) |
 | `ticket_types` | Tipos de ticket configurables | nombre, `default_area_id`; plantillas seed **'venta'** y **'consulta'** provistas ('venta': nuevo → contactado → presupuestado → cerrado/perdido, área Ventas con round-robin, evento 'link enviado'; 'consulta': nuevo → atendido → resuelto, sin área fija) |
@@ -407,7 +407,13 @@ de referencia):
 **RF4: Catálogo unificado**
 - **Descripción**: `catalog_items` con `kind` (producto|servicio); alta/edición por
   Owner/Admin; búsqueda full-text para Hermes (`search_catalog`); solo servicios
-  (con `duration_min`) son reservables.
+  (con `duration_min`) son reservables. El catálogo lleva **conocimiento orientado al
+  agente**: `description` (qué es), `use_cases` (qué problemas resuelve, para quién —
+  el `[RESULTADO]` de la doctrina RF23) y `limitations` (qué NO cubre — honestidad
+  pre-venta); el FTS de `search_catalog` indexa los tres campos, así el match nace del
+  problema que el Cliente describe y no solo del nombre del ítem. Si las respuestas
+  crecen, un `get_catalog_item` de detalle complementa el search ligero (decisión de
+  diseño de T7).
 - **Prioridad**: Must (F1)
 - **Criterios de Aceptación**:
   - [ ] Dado un `catalog_items` con `kind=producto`, cuando Hermes busca slots de reserva
@@ -951,3 +957,4 @@ conversacional.
 | 2026-11-26 | 1.8 | Kike (con el Gentleman) | Ubicaciones (revisión post-aprobación, T5a/T5b): dirección de texto + coordenadas lat/lng en clients y bookings (ubicación compartida por WhatsApp; live location nunca se almacena; asunción de fallback si el bridge no entrega el payload); ubicación del negocio en business_profile (texto + coords + `maps_url`) compartible por Hermes. |
 | 2026-11-26 | 1.9 | Kike (con el Gentleman) | Datos de contacto del negocio (revisión post-aprobación, T6): `business_profile` gana `phone` (llamadas, distinto del messenger_id), `email`, `website_url` (web institucional, distinta de `online_store_url`) y `social_links` (red→URL); Hermes los comparte con conducción (RF23). |
 | 2026-11-26 | 1.10 | Kike (con el Gentleman) | Canal e-mail definido (revisión post-aprobación, T7a/T7b): flujo canal-agnóstico (caller-id = correo del sender); cadencia casi inmediata (poll ~5 min configurable — el e-mail se comporta como chat lento); adjuntos out of scope v1 (evolución condicionada a multimodalidad de Hermes); pairing del canal e-mail sin verificación previa → verificar en F1 con el bridge real. |
+| 2026-11-26 | 1.11 | Kike (con el Gentleman) | Conocimiento de catálogo orientado al agente (pre-T4, para que el schema nazca con los campos): `catalog_items` gana `use_cases` (qué problemas resuelve — alimenta el [RESULTADO] de RF23 y el FTS) y `limitations` (qué NO cubre — honestidad pre-venta, menos reclamos); RF4 aclara que el FTS indexa description+use_cases+limitations y anota el `get_catalog_item` opcional de detalle para T7. |
