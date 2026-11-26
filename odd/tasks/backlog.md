@@ -34,3 +34,14 @@
 | R3-002 (review-68febdeb10f15fde) | corrupt-row guard order couples to the observable outcome | **No action** — same nuance as R1-ordering |
 | misspell/producto (T4 worker report) | `producto` flagged as an English misspelling; worker carried a scoped nolint | **Fixed** — T4: added to misspell ignore-rules, nolint dropped |
 | auth port doc order (T4 worker report) | internal/auth/lookup.go doc said "clients... then accounts" while the PRD §3.8 chain is accounts-first | **Fixed** — T4: port doc aligned to §3.8 accounts-first |
+| R1-ascii-fold (review-31ae9e99067acc33) | lower() folds ASCII only — non-ASCII local parts compare byte-exact | **No action** — documented deterministic behavior (schema + adapter) |
+| R1-enabled-shadow (review-31ae9e99067acc33) | disabled account sharing an identifier shadows a coexisting client row forever | **No action** — spec-compliant (§3.8 accounts-first); F4 panel note: warn when transferring identifiers |
+| R2-002 (review-31ae9e99067acc33) | test comment described coverage the fixture never created | **Fixed** — T5 rider: comment now states what the test pins (guard-before-lookup); behavior untouched |
+| R2-003 (review-31ae9e99067acc33) | TestOpenRefusesInvalidPath lives in migrate_test.go | **T7** — move to open_test.go with the next internal/db touch |
+| R2-004 (review-31ae9e99067acc33) | seed via string concatenation of constants — normalizes DDL interleave | **T7** — parameterize or guard-comment when the FTS migration lands |
+| R3-001 (review-31ae9e99067acc33) | DSN built by concatenation, guard fragile against future DSN params | **T7** — same internal/db touch |
+| R3-003 (review-31ae9e99067acc33) | appliedVersions loads all versions into memory | **T7** — MAX/COUNT refactor in the same pass |
+| R3-004 (review-31ae9e99067acc33) | MkdirAll leaves the directory if migrate fails — cleanup untested | **T7** — cleanup test in the same pass |
+| R2-001 (review-31ae9e99067acc33) | lookupAccount/lookupClient/findAccount/findClient structural duplicates (4 places) | **Post-F1 refactor sweep** — unify helpers in a type:refactor work-unit |
+| R3-002 (review-31ae9e99067acc33) | ErrCallerNotFound sentinel reused across 4 queries — 'no match' vs 'table absent' needs query order to distinguish | **Post-F1 refactor sweep** — same pass as R2-001 |
+| misspell/clientes (T5 worker report) | `clientes` flagged as an English misspelling (24 hits) | **Fixed** — T5: added to misspell ignore-rules (third Spanish word; pattern: add, never reword canonical strings) |
