@@ -3,12 +3,12 @@ package main
 import (
 	"net/http"
 	"net/http/httptest"
+	"strconv"
 	"strings"
 	"testing"
 )
 
-// TestHealthz pins the only surface of the T1 skeleton: the liveness probe
-// answers 200 with its JSON body.
+// TestHealthz pins the liveness probe: it answers 200 with its JSON body.
 func TestHealthz(t *testing.T) {
 	req := httptest.NewRequest(http.MethodGet, "/healthz", nil)
 	rec := httptest.NewRecorder()
@@ -21,6 +21,35 @@ func TestHealthz(t *testing.T) {
 	if got := rec.Body.String(); got != `{"status":"ok"}` {
 		t.Fatalf("healthz body = %q, se espera el JSON canónico", got)
 	}
+}
+
+// TestMcpPostOnly pins the RF1 transport contract: non-POST methods are
+// rejected with 405 and the Allow header; POST currently answers 501 with
+// the semantic placeholder until T6 wires the MCP protocol.
+func TestMcpPostOnly(t *testing.T) {
+	t.Run("GET responde 405 con Allow POST", func(t *testing.T) {
+		req := httptest.NewRequest(http.MethodGet, "/mcp", nil)
+		rec := httptest.NewRecorder()
+		newMux().ServeHTTP(rec, req)
+		if rec.Code != http.StatusMethodNotAllowed {
+			t.Fatalf("GET /mcp = %d, se espera 405", rec.Code)
+		}
+		if got := rec.Header().Get("Allow"); got != http.MethodPost {
+			t.Fatalf("Allow = %q, se espera POST", got)
+		}
+	})
+
+	t.Run("POST responde 501 semántico por ahora", func(t *testing.T) {
+		req := httptest.NewRequest(http.MethodPost, "/mcp", nil)
+		rec := httptest.NewRecorder()
+		newMux().ServeHTTP(rec, req)
+		if rec.Code != http.StatusNotImplemented {
+			t.Fatalf("POST /mcp = %d, se espera 501 hasta T6", rec.Code)
+		}
+		if !strings.Contains(rec.Body.String(), "aún no está implementado") {
+			t.Fatalf("POST /mcp body = %q, se espera mensaje semántico", rec.Body.String())
+		}
+	})
 }
 
 // TestResolvePort pins the fail-closed config rule: invalid values refuse to
@@ -39,6 +68,18 @@ func TestResolvePort(t *testing.T) {
 			t.Fatalf("resolvePort(\"3101\") = %d, %v; se espera 3101, nil", got, err)
 		}
 	})
+
+	// Boundary values pin the exact accepted range (advisory R3-002): a
+	// regression flipping the bounds to 2-65534 must be caught here.
+	for _, raw := range []string{"1", "65535"} {
+		t.Run("boundary válido "+raw, func(t *testing.T) {
+			got, err := resolvePort(raw)
+			want, _ := strconv.Atoi(raw)
+			if err != nil || got != want {
+				t.Fatalf("resolvePort(%q) = %d, %v; se espera %d, nil", raw, got, err, want)
+			}
+		})
+	}
 
 	for _, raw := range []string{"no-numérico", "0", "-1", "65536", "1e3"} {
 		t.Run("inválido "+raw+" falla cerrado", func(t *testing.T) {
