@@ -81,10 +81,19 @@ jobs:
           #    A transient API failure (rate limit, network) must not masquerade
           #    as "issue does not exist": retry once, then report both
           #    possibilities honestly. The gate stays fail-closed in every case.
+          # issue_labels fetches an issue's labels JSON with one backoff retry:
+          # a rate-limited first call is likely to fail again instantly, so the
+          # second attempt waits. The gate stays fail-closed on total failure.
+          issue_labels() {
+            local n="$1" out=""
+            out="$(gh issue view "$n" --repo "$GITHUB_REPOSITORY" --json labels 2>/dev/null)" && { printf '%s' "$out"; return 0; }
+            sleep 5
+            out="$(gh issue view "$n" --repo "$GITHUB_REPOSITORY" --json labels 2>/dev/null)" && { printf '%s' "$out"; return 0; }
+            return 1
+          }
           for n in $issues; do
-            labels_json="$(gh issue view "$n" --repo "$GITHUB_REPOSITORY" --json labels 2>/dev/null)" \
-              || labels_json="$(gh issue view "$n" --repo "$GITHUB_REPOSITORY" --json labels 2>/dev/null)" \
-              || fail "Closes #$n: issue #$n does not exist in $GITHUB_REPOSITORY — or its validation failed twice (transient API error). If you are sure the issue exists, wait and re-run this check; do not edit a valid link."
+            labels_json="$(issue_labels "$n")" \
+              || fail "Closes #$n: issue #$n could not be validated (not found, or the API failed twice). If the issue exists, wait and re-run this check; do not edit a valid link."
             printf '%s' "$labels_json" | jq -r '.labels[].name' | grep -qx 'status:approved' \
               || fail "issue #$n is linked but lacks the owner-granted 'status:approved' label."
           done
@@ -116,7 +125,7 @@ jobs:
           # but assert digits anyway so the test() pattern can never receive
           # an unexpected token.
           case "$ISSUE" in ''|*[!0-9]*) \
-            echo "::warning::non-numeric issue number '$ISSUE'; nothing to re-flag" >&2; exit 0;; esac
+            echo "::error::non-numeric issue number '$ISSUE'; refusing to re-flag anything" >&2; exit 1;; esac
           linked="$(gh pr list --repo "$GITHUB_REPOSITORY" --state open --limit 500 --json number,headRefOid,body \
             -q '.[] | select((.body // "") | test("(?i)\\b(closes|fixes|resolves)\\b[^0-9]*#'"$ISSUE"'\\b")) | [.number, .headRefOid] | @tsv')"
           # An empty result must not feed the loop (a blank line would POST a
