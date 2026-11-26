@@ -1,0 +1,58 @@
+# CI — the AGENTS.md pre-commit pipeline, enforced on every push to main and
+# every PR. Lands WITH the first Go skeleton (F1 T1) so it self-validates on its
+# own first run via pull_request.
+#
+# Post-merge sequencing (AGENTS.md): main runs cancel the superseded run
+# (cancel-in-progress on main only) — never land the next change on main while
+# the previous squash-merge run is still pending or cancelled.
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.ref == 'refs/heads/main' }}
+
+permissions:
+  contents: read
+
+jobs:
+  ci:
+    name: ci
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: gofmt (files must be formatted)
+        run: |
+          UNFORMATTED="$(gofmt -l .)"
+          if [ -n "$UNFORMATTED" ]; then
+            echo "::error::archivos sin formato gofmt:" $UNFORMATTED
+            exit 1
+          fi
+
+      - name: go vet
+        run: go vet ./...
+
+      - name: golangci-lint
+        uses: golangci/golangci-lint-action@v7
+        with:
+          version: v2.14.0
+
+      - name: go build
+        run: go build -o /dev/null ./...
+
+      - name: go test -race
+        run: go test -v -race ./...
