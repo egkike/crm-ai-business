@@ -161,11 +161,87 @@ is ambiguous, stop and hand back with the evidence.
 - **Post-merge:** wait for the `main` CI run triggered by the squash-merge to finish green
   before landing the next change on `main`.
 
-> **Governance (PENDING):** the issue-first PR gate, label protocol, required-status
-> checks and ruleset procedures are not yet defined for this repository. That discussion
-> is tracked as a pending owner decision; until it lands, treat this section as the
-> provisional baseline and do not invent gate workflows. When governance is decided, this
-> section is updated with the concrete, verified procedure.
+### Issue-First PR Gate (mandatory)
+
+Every pull request into `main` must pass the `pr-gate` required status check
+(`.github/workflows/pr-gate.yml`, enforced by the `main-ci-gate` ruleset):
+
+1. **Issue linkage:** the PR body must close or resolve at least one issue of this
+   repository via a body keyword (`Closes #N`, `Fixes #N`, `Resolves #N` — case-insensitive).
+2. **Owner approval:** every linked issue must carry the `status:approved` label
+   (owner-granted — never self-assigned by agents).
+3. **Type label:** the PR must carry EXACTLY ONE `type:*` label (`type:feature`,
+   `type:bug`, `type:docs`, `type:refactor`).
+
+This gate applies to **every** change landing on `main`, documentation included: no
+file type reaches `main` without a pull request that satisfies the three conditions.
+
+**If the gate fails after you relabel the linked issue:** re-run the failed check
+(Actions → pr-gate → Re-run), or toggle any PR label — relabeling the issue does not
+re-trigger the gate. Removing `status:approved` from a linked issue re-flags the linked
+open PRs as failing (approval-revocation-alarm); re-run the gate after re-approval.
+
+### Issue Creation Protocol (owner pre-approval, standing grant)
+
+The `status:approved` label is owner-granted and protected — it is NEVER self-assigned
+by agents. Issues follow the ask-first protocol:
+
+1. **Draft (agent).** Before any code work, the agent proposes the title, body (problem,
+   invariants/evidence, scope, risk) and the exact label list: exactly ONE `type:*`
+   label. For ODD features, the issue body links the PRD RF(s) it implements.
+2. **Authorization (owner).** Reviewing the draft IS the approval act. The standing
+   grant authorizes creating the issue already carrying `status:approved` — it only
+   pre-labels a scope the owner already green-lit in conversation; it NEVER
+   self-authorizes. A grant for one feature never extends to another: without a current
+   owner instruction for that issue, it opens unlabeled and waits for owner approval.
+3. **Create (agent).** Verify the owner's host capability first (target-host
+   `viewerPermission` MAINTAIN or ADMIN; TRIAGE never suffices), make ONE create
+   attempt with the authorized labels (no blind retry), and require the host read-back
+   (identity, title, body, labels, state) as evidence before reporting. Classify the
+   result exactly `confirmed | no_write | unknown`; `unknown` stops every later mutation.
+4. **Creation is pre-validation only.** Labels stamped at birth avoid the late-relabel
+   case (which does not re-trigger the `pr-gate` check). Gate linkage, CI, native review
+   and owner merge remain unaffected.
+
+### Merge settings & sequencing
+
+- **Squash-merge only** (repository merge settings; branch auto-delete on merge).
+- **Post-merge sequencing (active once `ci.yml` lands with Phase 1):** after any PR is
+  squash-merged into `main`, wait for the `main` CI run triggered by that commit to
+  finish green **before landing the next change on `main`** — consecutive pushes cancel
+  the older CI run (cancel-in-progress), and a cancelled run on the squash-merge commit
+  provides no CI evidence for that exact SHA.
+- **Bootstrap record:** this governance package itself landed by direct commit before
+  the ruleset existed; from ruleset activation on, every change — documentation included
+  — travels by issue-linked pull request.
+
+### The main-ci-gate ruleset
+
+The ruleset (created via `gh api` after the gate files landed on `main`) enforces:
+PR-only into `main` (`required_approving_review_count: 0` — the owner self-merges;
+GitHub forbids self-approval anyway), the required status check `Validate issue
+linkage, approval, and type label`, and no force-push. `bypass_actors` is empty and
+`current_user_can_bypass` reads `never`: nothing reaches `main` without a PR that
+passes the gate.
+
+The ruleset lives outside the repository (GitHub settings), so `git revert` cannot
+restore it — **capture it before touching it**:
+
+```bash
+gh api repos/egkike/crm-ai-business/rulesets > /tmp/main-ci-gate.backup.json
+```
+
+Relax the gate only for these three cases: (1) a required check permanently absent for
+a valid commit (try `gh run rerun <id>` first — startup failures are often transient);
+(2) the gate blocks the fix to the gate itself; (3) an emergency revert of a commit that
+broke `main`. Relax by **adding a bypass for your own user — never by removing required
+checks or the pull_request rule** (that leaves `main` ungated until someone remembers),
+then restore and prove the restore: `bypass_actors` empty, `current_user_can_bypass`
+`never`, both rules present, squash-only. A relaxation that is not followed by a proved
+restore is an open security defect, not a forgotten step.
+
+**CI workflow:** `ci.yml` (Go pipeline) is deferred to Phase 1 — it joins the required
+checks in the ruleset when the first code lands.
 
 ## Cybersecurity Standards
 

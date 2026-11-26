@@ -91,7 +91,7 @@ the authorization model, risks and dependencies — lives in the
 
 This repository takes **issues only**: bug reports and feature requests through the issue
 forms; pull requests from outside the maintainer's gate are closed automatically. See
-[`CONTRIBUTING.md`](./CONTRIBUTING.md) (landing with the governance package).
+[`CONTRIBUTING.md`](./CONTRIBUTING.md).
 
 **Security:** do not report vulnerabilities in public issues — use the repository's
 *Report a vulnerability* private advisory.

@@ -1,0 +1,11 @@
+blank_issues_enabled: false
+contact_links:
+  - name: What this project is (and is not, yet)
+    url: https://github.com/egkike/crm-ai-business/blob/main/README.md
+    about: Read this before opening an issue — it covers the pre-alpha status, the architecture and the roadmap.
+  - name: Canonical requirements (PRD, Spanish)
+    url: https://github.com/egkike/crm-ai-business/blob/main/docs/PRD.md
+    about: The approved product definition — if you are proposing a change, check here first whether it is already planned or out of scope.
+  - name: Contribution policy
+    url: https://github.com/egkike/crm-ai-business/blob/main/CONTRIBUTING.md
+    about: This repository accepts issues only — pull requests are closed automatically.
