@@ -27,6 +27,10 @@ const (
 	queryAccountExistsByEmail = `SELECT EXISTS (SELECT 1 FROM accounts WHERE lower(email) = lower(?))`
 
 	insertClient = `INSERT INTO clients (id, phone, email, display_name) VALUES (?, ?, ?, ?)`
+
+	// queryClientExists is the ticket creation's client check (RF5): an internal
+	// caller opening a ticket on behalf of a client must name a row that exists.
+	queryClientExists = `SELECT EXISTS (SELECT 1 FROM clients WHERE id = ?)`
 )
 
 // SQLite result codes the insert classifier needs. modernc.org/sqlite reports
@@ -66,6 +70,25 @@ func NewClientsRepo(handle *sql.DB) (*ClientsRepo, error) {
 		return nil, errors.New("repositorio de clientes: se requiere una conexión a la base")
 	}
 	return &ClientsRepo{db: handle}, nil
+}
+
+// ClientExistsByID implements usecase.ClientDirectory: it reports whether a
+// clients row carries this internal UUID.
+//
+// It answers for the internal primary key only, never for a natural identifier:
+// the ticket use cases hold an id they resolved from the identity chain or from
+// the arguments, and a natural identifier would drag the case-folding rules of
+// RF3 into a question that has nothing to do with them.
+func (r *ClientsRepo) ClientExistsByID(ctx context.Context, id string) (bool, error) {
+	if id == "" {
+		return false, errors.New("repositorio de clientes: se requiere el id del cliente")
+	}
+
+	var exists bool
+	if err := r.db.QueryRowContext(ctx, queryClientExists, id).Scan(&exists); err != nil {
+		return false, fmt.Errorf("repositorio de clientes: verificar el cliente: %w", err)
+	}
+	return exists, nil
 }
 
 // AccountIdentifierExists implements usecase.AccountIdentifierChecker: it
