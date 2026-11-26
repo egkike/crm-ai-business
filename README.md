@@ -12,11 +12,12 @@
 
 <div align="center">
 
-🚧 **Pre-alpha — definition phase closed, implementation starting.** The canonical
-requirements document ([`docs/PRD.md`](./docs/PRD.md), Spanish) is approved and closed for
-revision; Phase 1 (`core-mcp`) is the first implementation phase. No code is released yet:
-there is nothing to install, and every install instruction you may find does not exist
-until Phase 6 lands.
+🚧 **Pre-alpha — Phase 1 (`core-mcp`) delivered.** The MCP server runs: identity by
+sender, anonymous client registration, catalog search with agent-oriented knowledge
+(what each item solves, what it does not), tickets with an audited history, and a
+role-gated tool catalog. See [`docs/demo.md`](./docs/demo.md) for the reproducible
+end-to-end script. No installers yet — those land with Phase 6; today you run the
+binary from source.
 
 </div>
 
@@ -68,7 +69,7 @@ interface:
 
 | Phase | Scope | Status |
 |---|---|---|
-| F1 · `core-mcp` | Hexagonal Go skeleton + SQLite schema + MCP server + RBAC + client registration + Hermes pairing — demo: a WhatsApp message becomes a ticket the staff answers | Planned |
+| F1 · `core-mcp` | Hexagonal Go skeleton + SQLite schema + MCP server + RBAC + client registration + Hermes pairing — demo: a WhatsApp message becomes a ticket the staff answers | **Delivered** |
 | F2 · `workflow-engine` | Configurable ticket types/states/transitions + declarative rules + in-process scheduler + areas/visibility + the internal Telegram bot | Planned |
 | F3 · `bookings` | Bookable staff, schedules, slot search (per staff or per area), three appointment kinds with address and buffer | Planned |
 | F4 · `web-internal` | Embedded Astro panel: login (sessions/argon2id/CSRF), ticket board, workflow editor, business settings, reports | Planned |
@@ -83,6 +84,11 @@ the authorization model, risks and dependencies — lives in the
 
 - [`docs/PRD.md`](./docs/PRD.md) — canonical Product Requirements Document (Spanish, approved)
 - [`docs/idea.md`](./docs/idea.md) — the original idea document (historical origin)
+- [`docs/pairing.md`](./docs/pairing.md) — connecting Hermes: identity contract, channels (the
+  e-mail channel is **pending verification**), the skill install and the mandatory tool allowlist
+- [`docs/demo.md`](./docs/demo.md) — reproducible end-to-end demo of what works today
+- [`skills/recepcionista-negocio/SKILL.md`](./skills/recepcionista-negocio/SKILL.md) — the Hermes
+  skill (resolutive doctrine, personas, guardrails)
 - [`AGENTS.md`](./AGENTS.md) — project conventions, architecture enforcement contract and
   development workflow (applies to AI-assisted development)
 - ODD feature tracking under `odd/tasks/` (created as each phase starts)
@@ -98,7 +104,14 @@ forms; pull requests from outside the maintainer's gate are closed automatically
 
 ## Development
 
-Not yet: the first Go code lands with Phase 1. The standards that code will follow —
+Run the tests (the scale ceiling is part of the suite):
+
+```bash
+go test -race ./...
+go test -run TestScaleCeiling ./internal/db/   # 10k clients / 100k tickets
+```
+
+The standards this code follows —
 hexagonal architecture, prepared statements only, semantic Spanish errors, the
 loopback invariant, PII masking, the full pre-commit pipeline — are already contracted
 in [`AGENTS.md`](./AGENTS.md).

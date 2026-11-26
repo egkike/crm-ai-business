@@ -79,7 +79,7 @@ Quotes are VERBATIM from docs/PRD.md v1.10 — the RF text is the spec; never pa
 | T8 | S5 | Tickets core: dto + 5 usecases double RBAC + TicketsRepo + corrección PII (R3-mask-split-run) | 59b73f9 + 24894ac (PR #27 → d2ad761) |
 | T8b | S5 | Transport: 5 tools role-gated + wiring + transport E2E | (este PR) |
 | T9 | S6,S7 | Skill recepcionista (doctrina resolutiva) + pairing doc (WA verificado, e-mail a verificar) | 1ad5cb4 |
-| T10 | S8 | Tests de volumen (10k sintéticos) + demo reproducible + cierre F1 (DoD) | (pend) |
+| T10 | S8 | Techo 10k/100k validado en CI + demo reproducible + README/cierre DoD | (este PR) |
 
 ## Log
 
@@ -181,3 +181,14 @@ Quotes are VERBATIM from docs/PRD.md v1.10 — the RF text is the spec; never pa
   + Catalog deps (sin wiring el binario no exponía las tools). Pipeline verde
   (7 paquetes -race, lint 0 issues tras problemas+columnas — 7ª y 8ª palabras).
   ~3.8k líneas. Issue #23.
+
+- L14 (2026-11-26, T10 — cierre F1): techo de escala VALIDADO en CI
+  (internal/db/volume_test.go: 10.000 clientes + 100.000 tickets + sus eventos en
+  una transacción; mediana medida — resolución de identidad 24µs, búsqueda FTS
+  132µs, presupuesto del PRD 200ms); demo reproducible documentada (docs/demo.md,
+  siete pasos contra el binario real, cada afirmación del PRD mapeada a su paso);
+  README actualizado (F1 entregada, índice de docs, cómo correr las pruebas).
+  DoD de F1: demo reproducible ✅ · RF1–RF4 y RF5 (tipo fijo) verificados en CI ✅ ·
+  go test -race verde ✅ · CI verde ✅. HONESTIDAD: el canal e-mail sigue
+  PENDIENTE DE VERIFICACIÓN contra el gateway real (docs/pairing.md §3) — no se
+  declara operativo.
