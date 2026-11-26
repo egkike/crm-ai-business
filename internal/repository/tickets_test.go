@@ -491,6 +491,183 @@ func TestTransitionTicketIsGuarded(t *testing.T) {
 	}
 }
 
+// TestAddTicketNoteWritesEventAndActivity pins the single write group of a note
+// (review R3-note-nonatomic): the audited event AND the activity of the ticket
+// land together, and the ticket the adapter reads back is the one after its own
+// note.
+func TestAddTicketNoteWritesEventAndActivity(t *testing.T) {
+	fixture := newTicketFixture(t)
+	ctx := context.Background()
+	id := uuid(725)
+	fixture.createTicket(t, openTicket{id: id, clientID: fixture.client})
+
+	before, found, err := fixture.repo.GetTicket(ctx, id)
+	if err != nil || !found {
+		t.Fatalf("GetTicket() = %t, %v", found, err)
+	}
+
+	// The timestamps have millisecond precision, so the two writes must be at
+	// least a millisecond apart to be distinguishable.
+	time.Sleep(3 * time.Millisecond)
+
+	payload := `{"text":"vuelvo por lo mismo"}`
+	record, applied, err := fixture.repo.AddTicketNote(ctx, dto.TicketNoteAppend{
+		TicketID:    id,
+		ClosedState: dto.TicketStateClosed,
+		Event:       dto.NewTicketEvent{Actor: uuid(51), Kind: dto.TicketEventKindNote, Payload: payload},
+	})
+	if err != nil {
+		t.Fatalf("AddTicketNote() error inesperado: %v", err)
+	}
+	if !applied {
+		t.Fatal("AddTicketNote() no anotó un ticket abierto")
+	}
+	if record.ID != id {
+		t.Fatalf("record.ID = %q, se esperaba %q", record.ID, id)
+	}
+	if record.UpdatedAt == before.UpdatedAt {
+		t.Fatalf("updated_at = %q, se esperaba que la nota moviera la actividad", record.UpdatedAt)
+	}
+	if record.State != before.State {
+		t.Fatalf("state = %q, la nota no debe cambiar el estado", record.State)
+	}
+
+	events, err := fixture.repo.ListTicketEvents(ctx, id)
+	if err != nil {
+		t.Fatalf("ListTicketEvents() error inesperado: %v", err)
+	}
+	if len(events) != 2 {
+		t.Fatalf("eventos = %d, se esperaba la creación y la nota", len(events))
+	}
+	note := events[len(events)-1]
+	if note.Kind != dto.TicketEventKindNote || note.Actor != uuid(51) {
+		t.Fatalf("último evento = %+v, se esperaba la nota con su actor", note)
+	}
+	if note.Payload != payload {
+		t.Fatalf("payload = %q, se esperaba %q", note.Payload, payload)
+	}
+}
+
+// TestAddTicketNoteRefusesAClosedTicket pins the state guard of the note (review
+// R1-NOTE-RACE): against a closed ticket the guarded touch matches no row, so the
+// note writes NOTHING — no event and no activity — instead of reopening a closed
+// conversation. A ticket that does not exist behaves the same (found=false).
+func TestAddTicketNoteRefusesAClosedTicket(t *testing.T) {
+	fixture := newTicketFixture(t)
+	ctx := context.Background()
+	id := uuid(726)
+	fixture.createTicket(t, openTicket{id: id, clientID: fixture.client, state: dto.TicketStateClosed})
+
+	before, found, err := fixture.repo.GetTicket(ctx, id)
+	if err != nil || !found {
+		t.Fatalf("GetTicket() = %t, %v", found, err)
+	}
+	time.Sleep(3 * time.Millisecond)
+
+	note := dto.TicketNoteAppend{
+		TicketID:    id,
+		ClosedState: dto.TicketStateClosed,
+		Event:       dto.NewTicketEvent{Actor: fixture.client, Kind: dto.TicketEventKindNote},
+	}
+	if _, applied, err := fixture.repo.AddTicketNote(ctx, note); err != nil || applied {
+		t.Fatalf("AddTicketNote(ticket cerrado) = %t, %v; se esperaba false sin error", applied, err)
+	}
+
+	after, _, err := fixture.repo.GetTicket(ctx, id)
+	if err != nil {
+		t.Fatalf("GetTicket() error inesperado: %v", err)
+	}
+	if after.UpdatedAt != before.UpdatedAt {
+		t.Fatalf("updated_at = %q, el ticket cerrado no debe moverse", after.UpdatedAt)
+	}
+	if events, err := fixture.repo.ListTicketEvents(ctx, id); err != nil || len(events) != 1 {
+		t.Fatalf("eventos = %d, %v; se esperaba solo la creación", len(events), err)
+	}
+
+	note.TicketID = uuid(727)
+	if _, applied, err := fixture.repo.AddTicketNote(ctx, note); err != nil || applied {
+		t.Fatalf("AddTicketNote(ticket inexistente) = %t, %v; se esperaba false sin error", applied, err)
+	}
+}
+
+// TestAddTicketNoteRollsBackAFailedAppend pins the atomicity of the failed path:
+// when the event cannot be written, the activity the transaction already touched
+// is rolled back with it, so the F2 inactivity clock never reads a note that does
+// not exist.
+func TestAddTicketNoteRollsBackAFailedAppend(t *testing.T) {
+	fixture := newTicketFixture(t)
+	ctx := context.Background()
+	id := uuid(728)
+	fixture.createTicket(t, openTicket{id: id, clientID: fixture.client})
+
+	before, found, err := fixture.repo.GetTicket(ctx, id)
+	if err != nil || !found {
+		t.Fatalf("GetTicket() = %t, %v", found, err)
+	}
+	time.Sleep(3 * time.Millisecond)
+
+	if _, err := fixture.handle.Exec(`DROP TABLE ticket_events`); err != nil {
+		t.Fatalf("romper la tabla de eventos: %v", err)
+	}
+	if _, _, err := fixture.repo.AddTicketNote(ctx, dto.TicketNoteAppend{
+		TicketID:    id,
+		ClosedState: dto.TicketStateClosed,
+		Event:       dto.NewTicketEvent{Actor: fixture.client, Kind: dto.TicketEventKindNote},
+	}); err == nil {
+		t.Fatal("AddTicketNote() debía fallar con la tabla de eventos ausente")
+	}
+
+	after, found, err := fixture.repo.GetTicket(ctx, id)
+	if err != nil || !found {
+		t.Fatalf("GetTicket() = %t, %v", found, err)
+	}
+	if after.UpdatedAt != before.UpdatedAt {
+		t.Fatalf("updated_at = %q, la nota fallida no debe mover la actividad", after.UpdatedAt)
+	}
+}
+
+// TestAddTicketNoteRejectsBrokenInput pins that the adapter refuses what cannot
+// be written BEFORE a transaction exists: an unknown "closed" state would make
+// the guard accept every row, so it is a programming error and not a business
+// rejection.
+func TestAddTicketNoteRejectsBrokenInput(t *testing.T) {
+	fixture := newTicketFixture(t)
+	id := uuid(729)
+	fixture.createTicket(t, openTicket{id: id, clientID: fixture.client})
+
+	cases := []struct {
+		name string
+		note dto.TicketNoteAppend
+	}{
+		{"sin ticket", dto.TicketNoteAppend{
+			ClosedState: dto.TicketStateClosed,
+			Event:       dto.NewTicketEvent{Actor: fixture.client, Kind: dto.TicketEventKindNote},
+		}},
+		{"estado de cierre desconocido", dto.TicketNoteAppend{
+			TicketID:    id,
+			ClosedState: "archivado",
+			Event:       dto.NewTicketEvent{Actor: fixture.client, Kind: dto.TicketEventKindNote},
+		}},
+		{"sin actor", dto.TicketNoteAppend{
+			TicketID:    id,
+			ClosedState: dto.TicketStateClosed,
+			Event:       dto.NewTicketEvent{Kind: dto.TicketEventKindNote},
+		}},
+		{"payload inválido", dto.TicketNoteAppend{
+			TicketID:    id,
+			ClosedState: dto.TicketStateClosed,
+			Event:       dto.NewTicketEvent{Actor: fixture.client, Kind: dto.TicketEventKindNote, Payload: "{no es json"},
+		}},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if _, applied, err := fixture.repo.AddTicketNote(context.Background(), tc.note); err == nil || applied {
+				t.Fatalf("AddTicketNote(%+v) = %t, %v; debía fallar", tc.note, applied, err)
+			}
+		})
+	}
+}
+
 // TestTouchTicketMovesActivity pins the activity signal: updated_at moves forward
 // (it is what the F2 scheduler reads for inactivity) while the state is untouched.
 func TestTouchTicketMovesActivity(t *testing.T) {

@@ -78,7 +78,7 @@ Quotes are VERBATIM from docs/PRD.md v1.10 — the RF text is the spec; never pa
 | T7 | S4 | FTS5 v3 (v1.11 fields) + CatalogRepo + 3 usecases + 3 tools + 5 riders db + wiring | (este PR) |
 | T8 | S5 | Tickets core: dto + 5 usecases double RBAC + TicketsRepo + corrección PII (R3-mask-split-run) | 59b73f9 + 24894ac (PR #27 → d2ad761) |
 | T8b | S5 | Transport: 5 tools role-gated + wiring + transport E2E | (este PR) |
-| T9 | S6,S7 | Skill recepcionista (doctrina resolutiva) + pairing doc (WA verificado, e-mail a verificar) | 1ad5cb4 |
+| T9 | S6,S7 | Skill recepcionista (doctrina resolutiva) + pairing doc (**WA verificado; canal e-mail PENDIENTE de verificación** — no se declara operativo) | 1ad5cb4 |
 | T10 | S8 | Techo 10k/100k validado en CI + demo reproducible + README/cierre DoD | (este PR) |
 
 ## Log
@@ -192,3 +192,20 @@ Quotes are VERBATIM from docs/PRD.md v1.10 — the RF text is the spec; never pa
   go test -race verde ✅ · CI verde ✅. HONESTIDAD: el canal e-mail sigue
   PENDIENTE DE VERIFICACIÓN contra el gateway real (docs/pairing.md §3) — no se
   declara operativo.
+
+- L15 (2026-11-26, sweep post-F1): issue #33, branch refactor/post-f1-advisory-sweep.
+  DELEGADO a gentle-ai-worker con 5 fixes; el worker reportó status
+  `interaction_required` (honesto: fix 5 medía 634ms/1.354s bajo -race vs el
+  presupuesto de 200ms) y ofreció tres opciones — el orquestador eligió la 1
+  (arreglar la causa, no saltar el test) y la ejecutó inline: migración v4
+  `tickets_activity_idx (updated_at, id)` + división del statement de listado en
+  dos vistas (el disjunct `(? = '' OR client_id = ?)` impedía el seek del índice).
+  Resultado medido bajo -race, todo dentro de 200ms: 993µs / 971µs resolución,
+  6.2ms catálogo, 2.44ms listado por cliente, 83.5ms listado global, 1.55ms
+  transición. El índice no es un parche para el test: el listado a 100k era O(n)
+  en producción (13ms medidos, degradándose con el volumen).
+  Fixes entregados: nota atómica (append+touch+guard en una tx), bounds en los
+  decoders (50/120/2000 → invalid_arguments), client_id rechazado para rol
+  cliente (defensa en profundidad), test del cierre del handle con control
+  positivo, y el techo midiendo listado y transición. Suite completa verde con
+  -race (internal/db 63s por el techo: esperado).

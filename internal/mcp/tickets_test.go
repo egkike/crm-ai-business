@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"net/http"
 	"sort"
+	"strings"
 	"sync"
 	"testing"
 
@@ -38,12 +39,11 @@ const (
 // validation and the real audit payloads, and only the persistence is doubled (the
 // SQL is pinned by the repository tests).
 type fakeTicketStore struct {
-	mu       sync.Mutex
-	tickets  map[string]dto.TicketRecord
-	events   map[string][]dto.TicketEventRecord
-	nextID   int64
-	clock    int
-	appended []dto.NewTicketEvent
+	mu      sync.Mutex
+	tickets map[string]dto.TicketRecord
+	events  map[string][]dto.TicketEventRecord
+	nextID  int64
+	clock   int
 }
 
 func newFakeTicketStore() *fakeTicketStore {
@@ -151,31 +151,28 @@ func (f *fakeTicketStore) TransitionTicket(_ context.Context, transition dto.Tic
 	return true, nil
 }
 
-func (f *fakeTicketStore) AppendTicketEvent(_ context.Context, event dto.NewTicketEvent) (dto.TicketEventRecord, error) {
+// AddTicketNote is the atomic note write: it refuses a ticket that is not open
+// (returning found=false and writing nothing) and otherwise stores the event AND
+// moves the activity, exactly like the repository transaction.
+func (f *fakeTicketStore) AddTicketNote(_ context.Context, note dto.TicketNoteAppend) (dto.TicketRecord, bool, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 
-	f.appended = append(f.appended, event)
-	return f.append(event.TicketID, event.Actor, event.Kind, event.Payload), nil
+	current, ok := f.tickets[note.TicketID]
+	if !ok || current.State.Closed() {
+		return dto.TicketRecord{}, false, nil
+	}
+
+	current.UpdatedAt = f.stamp()
+	f.tickets[note.TicketID] = current
+	f.append(note.TicketID, note.Event.Actor, note.Event.Kind, note.Event.Payload)
+	return current, true, nil
 }
 
 func (f *fakeTicketStore) ListTicketEvents(_ context.Context, ticketID string) ([]dto.TicketEventRecord, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	return append([]dto.TicketEventRecord(nil), f.events[ticketID]...), nil
-}
-
-func (f *fakeTicketStore) TouchTicket(_ context.Context, id string) (bool, error) {
-	f.mu.Lock()
-	defer f.mu.Unlock()
-
-	ticket, ok := f.tickets[id]
-	if !ok {
-		return false, nil
-	}
-	ticket.UpdatedAt = f.stamp()
-	f.tickets[id] = ticket
-	return true, nil
 }
 
 // fakeTicketDirectory is the ClientDirectory double: it knows the client ids the
@@ -625,6 +622,119 @@ func TestStaffOpensATicketOnBehalf(t *testing.T) {
 	response := callTool(t, fixture.handler, staffCaller, createTicketTool,
 		`{"motive":"reclamo","client_id":"00000000-0000-4000-8000-0000000000ff"}`)
 	assertSemanticWire(t, response, usecase.CodeClientNotFound, "no existe un cliente con ese identificador.")
+}
+
+// TestClientCannotNameTheTicketOwner pins review R1-ticket-clientid-trust: the
+// owner of a ticket is never an argument. A client sending client_id is refused as
+// a protocol error BEFORE the use case runs (defense in depth over the use case
+// that overwrites the field), and an internal caller keeps the argument because the
+// internal path needs it.
+func TestClientCannotNameTheTicketOwner(t *testing.T) {
+	fixture := newTicketsFixture(t)
+
+	response := callTool(t, fixture.handler, emailCaller, createTicketTool,
+		`{"motive":"consulta","client_id":"55555555-5555-4555-8555-555555555555"}`)
+	assertInvalidArguments(t, response)
+
+	// The refusal happens before the use case: nothing was created.
+	stored, err := fixture.store.ListTickets(context.Background(), dto.TicketQuery{IncludeClosed: true, Limit: 50})
+	if err != nil {
+		t.Fatalf("ListTickets() error inesperado: %v", err)
+	}
+	if len(stored) != 0 {
+		t.Fatalf("tickets = %v, el rechazo no debe crear nada", stored)
+	}
+
+	// The internal side keeps the same argument: it is how a call produces a ticket
+	// for the client it was about.
+	created := ticketCallResult(t, callTool(t, fixture.handler, staffCaller, createTicketTool,
+		`{"motive":"reclamo recibido por teléfono","client_id":"44444444-4444-4444-8444-444444444444"}`))
+	if created.ClientID != "44444444-4444-4444-8444-444444444444" {
+		t.Fatalf("client_id = %q, se esperaba el cliente indicado por el staff", created.ClientID)
+	}
+}
+
+// TestTicketDecodersEnforceSchemaBounds pins review R3-schema-decoder-bounds: every
+// bound the input schemas declare is enforced by the decoder, so an oversized value
+// is a protocol rejection (-32602 / invalid_arguments) at the transport instead of a
+// business rejection one layer down.
+func TestTicketDecodersEnforceSchemaBounds(t *testing.T) {
+	fixture := newTicketsFixture(t)
+	created := ticketCallResult(t, callTool(t, fixture.handler, emailCaller, createTicketTool, `{"motive":"consulta"}`))
+
+	cases := []struct {
+		name      string
+		tool      string
+		arguments string
+	}{
+		{
+			name:      "limit sobre el máximo",
+			tool:      listMyTicketsTool,
+			arguments: `{"limit":51}`,
+		},
+		{
+			name:      "motivo sobre el máximo",
+			tool:      createTicketTool,
+			arguments: `{"motive":"` + strings.Repeat("a", 121) + `"}`,
+		},
+		{
+			name:      "texto de nota sobre el máximo",
+			tool:      addTicketNoteTool,
+			arguments: `{"ticket_id":"` + created.ID + `","text":"` + strings.Repeat("a", 2001) + `"}`,
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			assertInvalidArguments(t, callTool(t, fixture.handler, emailCaller, tc.tool, tc.arguments))
+		})
+	}
+
+	// Nothing was written by any of the refusals.
+	if events, err := fixture.store.ListTicketEvents(context.Background(), created.ID); err != nil || len(events) != 1 {
+		t.Fatalf("eventos = %d, %v; los rechazos de argumentos no deben escribir", len(events), err)
+	}
+}
+
+// TestTicketDecodersAcceptTheBoundary pins the other half of the bounds: exactly
+// 50 tickets per page, 120 runes of motive and 2000 runes of note are INSIDE the
+// declared schema and must be accepted, so the enforcement is a bound and not an
+// off-by-one rejection.
+func TestTicketDecodersAcceptTheBoundary(t *testing.T) {
+	fixture := newTicketsFixture(t)
+
+	created := ticketCallResult(t, callTool(t, fixture.handler, emailCaller, createTicketTool,
+		`{"motive":"`+strings.Repeat("a", 120)+`"}`))
+	if len(created.Events) != 1 {
+		t.Fatalf("eventos = %d, se esperaba la creación del ticket con el motivo límite", len(created.Events))
+	}
+
+	page := ticketListCallResult(t, callTool(t, fixture.handler, emailCaller, listMyTicketsTool, `{"limit":50}`))
+	if len(page) != 1 {
+		t.Fatalf("tickets = %d, se esperaba el ticket con el límite máximo de página", len(page))
+	}
+
+	noted := ticketCallResult(t, callTool(t, fixture.handler, emailCaller, addTicketNoteTool,
+		`{"ticket_id":"`+created.ID+`","text":"`+strings.Repeat("a", 2000)+`"}`))
+	if len(noted.Events) != 2 {
+		t.Fatalf("eventos = %d, se esperaba la nota con el texto límite", len(noted.Events))
+	}
+}
+
+// assertInvalidArguments pins a protocol-level argument rejection: -32602 with the
+// transport's own data.code.
+func assertInvalidArguments(t *testing.T, response rpcResponse) {
+	t.Helper()
+
+	if response.Error == nil {
+		t.Fatalf("se esperaba error JSON-RPC, result: %s", response.Result)
+	}
+	if response.Error.Code != -32602 {
+		t.Fatalf("code = %d, se espera -32602", response.Error.Code)
+	}
+	if got := response.dataCode(t); got != "invalid_arguments" {
+		t.Fatalf("data.code = %q, se esperaba invalid_arguments", got)
+	}
 }
 
 // TestClientCannotReadAnotherClientsTickets pins the anti-oracle rule over the wire:

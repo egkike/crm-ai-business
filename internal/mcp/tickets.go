@@ -4,10 +4,13 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
+	"unicode/utf8"
 
 	gomcp "github.com/modelcontextprotocol/go-sdk/mcp"
 
 	"github.com/egkike/crm-ai-business/internal/application/dto"
+	"github.com/egkike/crm-ai-business/internal/application/usecase"
 	"github.com/egkike/crm-ai-business/internal/auth"
 )
 
@@ -65,6 +68,13 @@ const (
 // register_client: an unknown key is an attempt to smuggle a second contract in —
 // an "actor", a "state" on creation, a "client_id" where the identity must come
 // from the request — and it is refused, never ignored.
+//
+// The bounds are declared twice on purpose and must stay equal: the JSON schema
+// says what the agent is promised (maxLength 120 / 2000, limit 1..50) and the
+// decoders below enforce it before a use case runs (review
+// R3-schema-decoder-bounds). The declared numbers mirror usecase.MaxTicketMotiveLen,
+// usecase.MaxTicketNoteLen and usecase.MaxTicketListLimit, and the use cases
+// re-enforce them independently.
 var (
 	createTicketInputSchema = json.RawMessage(`{
   "type": "object",
@@ -76,7 +86,7 @@ var (
     },
     "client_id": {
       "type": "string",
-      "description": "Solo para el equipo interno: identificador interno (UUID) del cliente para el que se abre el ticket. Un cliente siempre abre su propio ticket y este campo se ignora."
+      "description": "Solo para el equipo interno: identificador interno (UUID) del cliente para el que se abre el ticket. Un cliente siempre abre su propio ticket: no envíes este campo, la llamada se rechaza."
     }
   },
   "required": ["motive"],
@@ -278,7 +288,9 @@ func newTicketListOutput(result dto.TicketListResult) ticketListOutput {
 // the product's main flow, and a staff member opening the ticket a phone call
 // produced is the internal counterpart — the use case decides WHO the ticket
 // belongs to (the caller for a client, the named client for an internal role),
-// never the transport.
+// never the transport. A client that NAMES a client is refused here, before the
+// use case: the owner of a ticket is never an argument (review
+// R1-ticket-clientid-trust).
 func createTicketTool(create TicketCreate) Tool {
 	return Tool{
 		Definition: &gomcp.Tool{
@@ -296,7 +308,7 @@ func createTicketTool(create TicketCreate) Tool {
 				return nil, err
 			}
 
-			command, err := decodeCreateTicketArgs(rawArguments(req))
+			command, err := decodeCreateTicketArgs(rawArguments(req), caller.Role)
 			if err != nil {
 				return nil, err
 			}
@@ -442,8 +454,17 @@ func ticketListHandler(list ticketLister, toolName string) gomcp.ToolHandler {
 	}
 }
 
-// decodeCreateTicketArgs validates the creation arguments.
-func decodeCreateTicketArgs(raw json.RawMessage) (dto.CreateTicketCommand, error) {
+// decodeCreateTicketArgs validates the creation arguments for the role that
+// sends them.
+//
+// The role is a parameter because client_id is not a neutral field: for an
+// internal caller it names the client the ticket is opened for, and for a client
+// it is an attempt to choose ownership. The use case already overwrites it with the
+// resolved identity (a body field never decides who a client is), and refusing it
+// here is the second, independent barrier of defense in depth (review
+// R1-ticket-clientid-trust): the request does not travel one hop with a contract
+// violation in it.
+func decodeCreateTicketArgs(raw json.RawMessage, role auth.Role) (dto.CreateTicketCommand, error) {
 	arguments, err := argumentObject(raw, createTicketToolName)
 	if err != nil {
 		return dto.CreateTicketCommand{}, err
@@ -453,10 +474,16 @@ func decodeCreateTicketArgs(raw json.RawMessage) (dto.CreateTicketCommand, error
 	for key, value := range arguments {
 		switch key {
 		case argMotive:
-			if err := json.Unmarshal(value, &command.Motive); err != nil {
-				return dto.CreateTicketCommand{}, invalidArguments("motive debe ser un texto.")
+			motive, err := decodeBoundedText(value, argMotive, usecase.MaxTicketMotiveLen)
+			if err != nil {
+				return dto.CreateTicketCommand{}, err
 			}
+			command.Motive = motive
 		case argClientID:
+			if !role.IsInternal() {
+				return dto.CreateTicketCommand{}, invalidArguments(
+					"un cliente abre siempre su propio ticket: client_id no se acepta.")
+			}
 			if err := json.Unmarshal(value, &command.ClientID); err != nil {
 				return dto.CreateTicketCommand{}, invalidArguments("client_id debe ser un texto.")
 			}
@@ -490,15 +517,12 @@ func decodeTicketListArgs(raw json.RawMessage, toolName string) (dto.TicketQuery
 				query.IncludeClosed = *includeClosed
 			}
 		case argLimit:
-			limit, err := decodeOptionalInt(value, argLimit)
+			limit, err := decodePageLimit(value)
 			if err != nil {
 				return dto.TicketQuery{}, err
 			}
-			if limit != nil && *limit < 1 {
-				return dto.TicketQuery{}, invalidArguments("limit debe ser un entero mayor que cero.")
-			}
-			if limit != nil {
-				query.Limit = *limit
+			if limit != 0 {
+				query.Limit = limit
 			}
 		case argOffset:
 			offset, err := decodeOptionalInt(value, argOffset)
@@ -533,9 +557,11 @@ func decodeAddTicketNoteArgs(raw json.RawMessage) (dto.TicketNote, error) {
 				return dto.TicketNote{}, invalidArguments("ticket_id debe ser un texto.")
 			}
 		case argText:
-			if err := json.Unmarshal(value, &note.Text); err != nil {
-				return dto.TicketNote{}, invalidArguments("text debe ser un texto.")
+			text, err := decodeBoundedText(value, argText, usecase.MaxTicketNoteLen)
+			if err != nil {
+				return dto.TicketNote{}, err
 			}
+			note.Text = text
 		default:
 			return dto.TicketNote{}, invalidArguments(addTicketNoteToolName + " no acepta parámetros adicionales.")
 		}
@@ -568,6 +594,49 @@ func decodeTransitionTicketArgs(raw json.RawMessage) (dto.TransitionCommand, err
 		}
 	}
 	return command, nil
+}
+
+// decodeBoundedText decodes a required text argument and enforces the rune bound
+// its schema declares with maxLength.
+//
+// The bound is measured in runes (the unit the use case uses, so a two-byte
+// character is one character for both) on the value as sent: the schema's
+// maxLength is a promise about the request, and a request that breaks it is a
+// protocol error answered with -32602 and Spanish prose, never an echo of the
+// offending value.
+func decodeBoundedText(raw json.RawMessage, name string, maxRunes int) (string, error) {
+	var value string
+	if err := json.Unmarshal(raw, &value); err != nil {
+		return "", invalidArguments(name + " debe ser un texto.")
+	}
+	if utf8.RuneCountInString(value) > maxRunes {
+		return "", invalidArguments(fmt.Sprintf("%s no puede superar los %d caracteres.", name, maxRunes))
+	}
+	return value, nil
+}
+
+// decodePageLimit decodes the page size and enforces the window the list schema
+// declares: at least 1 and at most usecase.MaxTicketListLimit.
+//
+// An absent or null limit answers 0, which is "the caller sent none" and lets the
+// use case apply its default. An oversized page is REFUSED instead of being
+// silently capped: the agent asked for something the contract does not offer, and
+// a capped answer would look like a complete one.
+func decodePageLimit(raw json.RawMessage) (int, error) {
+	limit, err := decodeOptionalInt(raw, argLimit)
+	if err != nil {
+		return 0, err
+	}
+	if limit == nil {
+		return 0, nil
+	}
+	if *limit < 1 {
+		return 0, invalidArguments("limit debe ser un entero mayor que cero.")
+	}
+	if *limit > usecase.MaxTicketListLimit {
+		return 0, invalidArguments(fmt.Sprintf("limit no puede superar los %d tickets por página.", usecase.MaxTicketListLimit))
+	}
+	return *limit, nil
 }
 
 // decodeOptionalBool decodes an optional boolean argument. A JSON null (or an

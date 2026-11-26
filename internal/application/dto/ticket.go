@@ -215,6 +215,28 @@ type TicketTransition struct {
 	Event NewTicketEvent
 }
 
+// TicketNoteAppend is one note to append to a ticket's history, guarded by the
+// ticket still being open.
+//
+// The note travels with its guard for the same reason the transition does: the
+// audit and the activity signal must be written by the same statement group, so
+// a concurrent close cannot let the message land on a closed conversation. There
+// is no From state here on purpose — a note adds activity to an OPEN ticket, and
+// a transition between two open states (nuevo → atendido) must not invalidate it.
+// What the guard refuses is the closed state, which travels as a parameter
+// because the state vocabulary belongs to this layer (F2 turns it into rows).
+type TicketNoteAppend struct {
+	// TicketID is the internal UUID of the ticket the note belongs to.
+	TicketID string
+
+	// ClosedState is the state the guard refuses (F1: TicketStateClosed). A
+	// ticket in it, or a ticket that does not exist, writes nothing.
+	ClosedState TicketState
+
+	// Event is the audited note event.
+	Event NewTicketEvent
+}
+
 // TicketQuery is the filter of a ticket list.
 //
 // IncludeClosed defaults to false: the list views of F1 are the ACTIVE views, so

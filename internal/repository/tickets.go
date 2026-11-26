@@ -39,7 +39,20 @@ INSERT INTO tickets (id, ticket_type_id, client_id, state) VALUES (?, ?, ?, ?)`
 	selectTickets = `
 SELECT ` + ticketColumns + `
 FROM tickets
-WHERE (? = '' OR client_id = ?)
+WHERE (? = 1 OR state <> ?)
+ORDER BY updated_at DESC, id
+LIMIT ? OFFSET ?`
+
+	// selectTicketsByClient is the client view as its own statement. It is not a
+	// second dialect of SQL for style's sake: the `(? = '' OR client_id = ?)`
+	// disjunct of the old single statement made SQLite skip the
+	// tickets_activity_idx seek, which at the declared ceiling (100k tickets)
+	// measured 2.4s instrumented against a 200ms budget. Split, the client view
+	// seeks by client_id and the business view walks the activity index.
+	selectTicketsByClient = `
+SELECT ` + ticketColumns + `
+FROM tickets
+WHERE client_id = ?
   AND (? = 1 OR state <> ?)
 ORDER BY updated_at DESC, id
 LIMIT ? OFFSET ?`
@@ -60,6 +73,16 @@ WHERE id = ? AND state = ?`
 UPDATE tickets
 SET updated_at = strftime('%Y-%m-%dT%H:%M:%fZ','now')
 WHERE id = ?`
+
+	// touchOpenTicket records activity ONLY while the ticket is open. The
+	// `state <> ?` predicate is the guard of a note: the message of a
+	// conversation lands on an open ticket or it lands nowhere (a closed
+	// conversation is reopened by opening a new ticket, RF5). RowsAffected = 0 is
+	// therefore "the guard refused", exactly like updateTicketStateGuarded.
+	touchOpenTicket = `
+UPDATE tickets
+SET updated_at = strftime('%Y-%m-%dT%H:%M:%fZ','now')
+WHERE id = ? AND state <> ?`
 
 	insertTicketEvent = `
 INSERT INTO ticket_events (ticket_id, actor, kind, payload) VALUES (?, ?, ?, ?)`
@@ -190,11 +213,22 @@ func (r *TicketsRepo) queryTickets(ctx context.Context, clientID string, include
 		includeClosedFlag = 1
 	}
 
-	rows, err := r.db.QueryContext(ctx, selectTickets,
-		clientID, clientID,
-		includeClosedFlag, string(dto.TicketStateClosed),
-		limit, offset,
+	var (
+		rows *sql.Rows
+		err  error
 	)
+	if clientID == "" {
+		rows, err = r.db.QueryContext(ctx, selectTickets,
+			includeClosedFlag, string(dto.TicketStateClosed),
+			limit, offset,
+		)
+	} else {
+		rows, err = r.db.QueryContext(ctx, selectTicketsByClient,
+			clientID,
+			includeClosedFlag, string(dto.TicketStateClosed),
+			limit, offset,
+		)
+	}
 	if err != nil {
 		return nil, fmt.Errorf("repositorio de tickets: listar: %w", err)
 	}
@@ -333,6 +367,74 @@ func (r *TicketsRepo) ListTicketEvents(ctx context.Context, ticketID string) ([]
 	return events, nil
 }
 
+// AddTicketNote appends a note to the ticket's history, moves its activity and
+// reads the ticket back, all inside ONE transaction guarded by the ticket still
+// being open (review R1-NOTE-RACE / R3-note-nonatomic).
+//
+// The three steps are one write group for the same reason the creation is: a
+// note that is audited while updated_at stays put leaves the F2 inactivity clock
+// believing the conversation is idle, and a note written after somebody closed
+// the ticket reopens a conversation RF5 closed. The guard is decided by the
+// database (`state <> closed`), not by the read the use case already did, so the
+// decision and the write cannot interleave with another actor.
+//
+// It reports found=false when the ticket is gone or is closed: either way nothing
+// was written, and the use case owns the Spanish rejection.
+func (r *TicketsRepo) AddTicketNote(ctx context.Context, note dto.TicketNoteAppend) (dto.TicketRecord, bool, error) {
+	if err := validateNoteAppend(note); err != nil {
+		return dto.TicketRecord{}, false, err
+	}
+	payload, err := eventPayload(note.Event.Payload)
+	if err != nil {
+		return dto.TicketRecord{}, false, err
+	}
+
+	tx, err := r.db.BeginTx(ctx, nil)
+	if err != nil {
+		return dto.TicketRecord{}, false, fmt.Errorf("repositorio de tickets: abrir la nota: %w", err)
+	}
+	// The deferred rollback is the leak guard and the atomicity of the failed
+	// append: if the event insert fails, the activity touch above it is discarded
+	// with the transaction.
+	defer func() { _ = tx.Rollback() }()
+
+	activity, err := tx.ExecContext(ctx, touchOpenTicket, note.TicketID, string(note.ClosedState))
+	if err != nil {
+		return dto.TicketRecord{}, false, fmt.Errorf("repositorio de tickets: marcar la actividad de la nota: %w", err)
+	}
+	opened, err := activity.RowsAffected()
+	if err != nil {
+		return dto.TicketRecord{}, false, fmt.Errorf("repositorio de tickets: confirmar la actividad de la nota: %w", err)
+	}
+	if opened == 0 {
+		// Closed or gone: nothing was written, so the rollback has nothing to undo.
+		return dto.TicketRecord{}, false, nil
+	}
+
+	// The event is filed against THIS ticket's id (the carrier's own TicketID is
+	// ignored), so a note can never be attached to the wrong history.
+	if _, err := tx.ExecContext(ctx, insertTicketEvent,
+		note.TicketID,
+		note.Event.Actor,
+		note.Event.Kind,
+		payload,
+	); err != nil {
+		return dto.TicketRecord{}, false, fmt.Errorf("repositorio de tickets: insertar la nota: %w", err)
+	}
+
+	// The readback happens in the same transaction, so the caller gets the ticket
+	// as it is after its own note and not as some later writer left it.
+	record, err := scanTicket(tx.QueryRowContext(ctx, selectTicketByID, note.TicketID))
+	if err != nil {
+		return dto.TicketRecord{}, false, fmt.Errorf("repositorio de tickets: leer el ticket anotado: %w", err)
+	}
+
+	if err := tx.Commit(); err != nil {
+		return dto.TicketRecord{}, false, fmt.Errorf("repositorio de tickets: confirmar la nota: %w", err)
+	}
+	return record, true, nil
+}
+
 // TouchTicket records activity on the ticket and reports whether the row existed.
 func (r *TicketsRepo) TouchTicket(ctx context.Context, id string) (bool, error) {
 	if id == "" {
@@ -434,6 +536,25 @@ func validateTransition(transition dto.TicketTransition) error {
 		Actor:    transition.Event.Actor,
 		Kind:     transition.Event.Kind,
 		Payload:  transition.Event.Payload,
+	})
+}
+
+// validateNoteAppend rejects a note that cannot be written before a transaction
+// exists: the same rules the transition enforces, plus the state the guard
+// refuses (an unknown state would make `state <> ?` silently accept a closed
+// ticket).
+func validateNoteAppend(note dto.TicketNoteAppend) error {
+	if note.TicketID == "" {
+		return errors.New("repositorio de tickets: la nota no tiene ticket")
+	}
+	if !note.ClosedState.Valid() {
+		return fmt.Errorf("repositorio de tickets: el estado que cierra la conversación es desconocido %q", string(note.ClosedState))
+	}
+	return validateNewEvent(dto.NewTicketEvent{
+		TicketID: note.TicketID,
+		Actor:    note.Event.Actor,
+		Kind:     note.Event.Kind,
+		Payload:  note.Event.Payload,
 	})
 }
 
