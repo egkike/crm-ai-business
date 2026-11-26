@@ -35,12 +35,16 @@ type fakeTickets struct {
 	getErr        error
 	listErr       error
 	transitionErr error
-	appendErr     error
-	touchErr      error
+	noteErr       error
 
 	// refuseTransition makes the guarded write report "the ticket moved", which is
 	// how the use case sees a concurrent actor.
 	refuseTransition bool
+
+	// closeOnNote makes the guarded note write lose the race against a concurrent
+	// close: the store closes the ticket and reports "not open", so the use case
+	// has to phrase the rejection from what it reads afterwards.
+	closeOnNote bool
 }
 
 // clientQuery records one ListTicketsByClient call.
@@ -181,31 +185,36 @@ func (f *fakeTickets) TransitionTicket(_ context.Context, transition dto.TicketT
 	return true, nil
 }
 
-func (f *fakeTickets) AppendTicketEvent(_ context.Context, event dto.NewTicketEvent) (dto.TicketEventRecord, error) {
-	if f.appendErr != nil {
-		return dto.TicketEventRecord{}, f.appendErr
+// AddTicketNote is the atomic note write: it refuses a ticket that is not open
+// (closing it first when closeOnNote simulates the race) and otherwise stores the
+// event AND moves the activity, exactly like the repository transaction.
+func (f *fakeTickets) AddTicketNote(_ context.Context, note dto.TicketNoteAppend) (dto.TicketRecord, bool, error) {
+	if f.noteErr != nil {
+		return dto.TicketRecord{}, false, f.noteErr
 	}
-	f.appended = append(f.appended, event)
-	return f.append(event.TicketID, event.Actor, event.Kind, event.Payload), nil
+
+	current, ok := f.tickets[note.TicketID]
+	if !ok || current.State.Closed() {
+		return dto.TicketRecord{}, false, nil
+	}
+	if f.closeOnNote {
+		// Another actor's close won the race after the use case read the ticket.
+		current.State = dto.TicketStateClosed
+		f.tickets[note.TicketID] = current
+		return dto.TicketRecord{}, false, nil
+	}
+
+	f.appended = append(f.appended, note.Event)
+	f.touched = append(f.touched, note.TicketID)
+	_, updatedAt := f.stamp()
+	current.UpdatedAt = updatedAt
+	f.tickets[note.TicketID] = current
+	f.append(note.TicketID, note.Event.Actor, note.Event.Kind, note.Event.Payload)
+	return current, true, nil
 }
 
 func (f *fakeTickets) ListTicketEvents(_ context.Context, ticketID string) ([]dto.TicketEventRecord, error) {
 	return append([]dto.TicketEventRecord(nil), f.events[ticketID]...), nil
-}
-
-func (f *fakeTickets) TouchTicket(_ context.Context, id string) (bool, error) {
-	if f.touchErr != nil {
-		return false, f.touchErr
-	}
-	f.touched = append(f.touched, id)
-	ticket, ok := f.tickets[id]
-	if !ok {
-		return false, nil
-	}
-	_, updatedAt := f.stamp()
-	ticket.UpdatedAt = updatedAt
-	f.tickets[id] = ticket
-	return true, nil
 }
 
 // fakeClientDirectory is the ClientDirectory double.
@@ -762,6 +771,37 @@ func TestAddTicketNoteRejections(t *testing.T) {
 	}
 }
 
+// TestAddTicketNoteRejectsAConcurrentClose pins the guard of the note (review
+// R1-NOTE-RACE): the closed check the use case reads is not the one that decides
+// the write. When another actor closes the ticket between that read and the
+// atomic repository operation, the guard refuses and the caller gets the closed
+// rejection — the note never lands on a closed conversation.
+func TestAddTicketNoteRejectsAConcurrentClose(t *testing.T) {
+	store := newFakeTickets()
+	store.seed(dto.TicketRecord{ID: "ticket-a", ClientID: clientA})
+	store.closeOnNote = true
+
+	uc, err := usecase.NewAddTicketNote(store)
+	if err != nil {
+		t.Fatalf("NewAddTicketNote() error inesperado: %v", err)
+	}
+
+	_, err = uc.Execute(context.Background(), ticketCaller(clientA, auth.RoleClient), dto.TicketNote{
+		TicketID: "ticket-a",
+		Text:     "hola",
+	})
+	assertSemantic(t, err, usecase.CodeTicketClosed,
+		"el ticket está cerrado: una conversación cerrada no se reabre con una nota. Si el cliente vuelve, se abre un ticket nuevo.")
+
+	// Nothing was written by the losing call: no event and no activity of its own.
+	if len(store.appended) != 0 {
+		t.Fatalf("eventos escritos = %d, la nota rechazada no debe escribir", len(store.appended))
+	}
+	if len(store.touched) != 0 {
+		t.Fatalf("actividades = %v, la nota rechazada no debe mover el reloj de inactividad", store.touched)
+	}
+}
+
 // TestAddTicketNoteInternalOnAnyTicket pins the internal half: the team annotates
 // any ticket, including one assigned to somebody else and one that is closed.
 func TestAddTicketNoteInternalOnAnyTicket(t *testing.T) {
@@ -928,7 +968,7 @@ func TestTicketUseCasesWrapInternalFailures(t *testing.T) {
 
 	store = newFakeTickets()
 	store.seed(dto.TicketRecord{ID: "ticket-a", ClientID: clientA})
-	store.appendErr = cause
+	store.noteErr = cause
 	note, err := usecase.NewAddTicketNote(store)
 	if err != nil {
 		t.Fatalf("NewAddTicketNote() error inesperado: %v", err)

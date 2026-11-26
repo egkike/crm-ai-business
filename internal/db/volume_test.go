@@ -3,6 +3,7 @@ package db_test
 import (
 	"context"
 	"database/sql"
+	"errors"
 	"fmt"
 	"testing"
 	"time"
@@ -23,10 +24,18 @@ const (
 	// ceiling dataset loaded. Generous but real: it fails on an accidental O(n)
 	// scan, not on CI jitter.
 	ceilingBudget = 200 * time.Millisecond
+
+	// ceilingPageSize is the page the ticket views are measured with: the value the
+	// application layer applies by default (usecase.DefaultTicketListLimit).
+	ceilingPageSize = 20
 )
 
-// TestScaleCeiling seeds the declared ceiling and pins that identity resolution
-// and catalog search answer inside the budget on the loaded database.
+// TestScaleCeiling seeds the declared ceiling and pins that the tool paths README
+// promises answer inside the budget on the loaded database: identity resolution,
+// catalog search, the two ticket list views and a guarded transition
+// (review R3-coverage-scope — the first version measured resolution and search
+// only, so "the tools answer inside the budget" was a claim about half the
+// surface).
 func TestScaleCeiling(t *testing.T) {
 	ctx := context.Background()
 
@@ -49,6 +58,10 @@ func TestScaleCeiling(t *testing.T) {
 	catalog, err := repository.NewCatalogRepo(handle)
 	if err != nil {
 		t.Fatalf("NewCatalogRepo() error inesperado: %v", err)
+	}
+	tickets, err := repository.NewTicketsRepo(handle)
+	if err != nil {
+		t.Fatalf("NewTicketsRepo() error inesperado: %v", err)
 	}
 
 	// A client written first and one written last: the last is the honest probe
@@ -74,6 +87,88 @@ func TestScaleCeiling(t *testing.T) {
 			return err
 		})
 	})
+
+	// The ticket views are measured at the ceiling too, and each one is checked for a
+	// non-empty page first: timing an empty result would prove nothing about the
+	// query that the agent actually waits on.
+	t.Run("listado de los tickets de un cliente", func(t *testing.T) {
+		assertPage(t, tickets, ctx, volumeClientID(0))
+		measure(t, ceilingBudget, func() error {
+			_, err := tickets.ListTicketsByClient(ctx, volumeClientID(0), false, ceilingPageSize, 0)
+			return err
+		})
+	})
+
+	t.Run("listado de los tickets del negocio", func(t *testing.T) {
+		page, err := tickets.ListTickets(ctx, dto.TicketQuery{Limit: ceilingPageSize})
+		if err != nil {
+			t.Fatalf("ListTickets() error inesperado: %v", err)
+		}
+		if len(page) == 0 {
+			t.Fatal("ListTickets() no devolvió tickets con el techo cargado")
+		}
+		measure(t, ceilingBudget, func() error {
+			_, err := tickets.ListTickets(ctx, dto.TicketQuery{Limit: ceilingPageSize})
+			return err
+		})
+	})
+
+	// One transition, measured over alternating directions so every sample is a real
+	// guarded write on the loaded file (nuevo ↔ atendido are both legal in F1: it has
+	// no workflow engine yet).
+	t.Run("una transición", func(t *testing.T) {
+		id := volumeTicketID(0)
+		sample := 0
+		measure(t, ceilingBudget, func() error {
+			from, to := dto.TicketStateNew, dto.TicketStateAttended
+			if sample%2 == 1 {
+				from, to = to, from
+			}
+			sample++
+
+			applied, err := tickets.TransitionTicket(ctx, dto.TicketTransition{
+				TicketID: id,
+				From:     from,
+				To:       to,
+				Event: dto.NewTicketEvent{
+					TicketID: id,
+					Actor:    actorSystem,
+					Kind:     dto.TicketEventKindTransition,
+					Payload:  `{"from":"` + string(from) + `","to":"` + string(to) + `"}`,
+				},
+			})
+			if err != nil {
+				return err
+			}
+			if !applied {
+				return errTransitionNotApplied
+			}
+			return nil
+		})
+	})
+}
+
+// errTransitionNotApplied reports a guarded write that refused its own from-state
+// during the measurement: that is a broken fixture, not a slow sample.
+var errTransitionNotApplied = errors.New("la transición medida no se aplicó")
+
+// actorSystem is the audit actor of the backend itself (a scheduler or the engine
+// of F2): the ceiling seed and the measured transition act as the system, not as a
+// person.
+const actorSystem = "system"
+
+// assertPage fails when the client view of the seeded client answers no tickets (the
+// list timings must measure a real page).
+func assertPage(t *testing.T, tickets *repository.TicketsRepo, ctx context.Context, clientID string) {
+	t.Helper()
+
+	page, err := tickets.ListTicketsByClient(ctx, clientID, false, ceilingPageSize, 0)
+	if err != nil {
+		t.Fatalf("ListTicketsByClient() error inesperado: %v", err)
+	}
+	if len(page) == 0 {
+		t.Fatalf("ListTicketsByClient(%s) no devolvió tickets con el techo cargado", clientID)
+	}
 }
 
 // measure runs fn repeatedly and fails when the median answer exceeds the

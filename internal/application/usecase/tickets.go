@@ -66,17 +66,19 @@ type TicketStore interface {
 	// operabas" rejection instead of overwriting another actor's work.
 	TransitionTicket(ctx context.Context, transition dto.TicketTransition) (bool, error)
 
-	// AppendTicketEvent appends one event and returns it as stored (id and
-	// timestamp read back from the database).
-	AppendTicketEvent(ctx context.Context, event dto.NewTicketEvent) (dto.TicketEventRecord, error)
+	// AddTicketNote appends a note to the history, moves the ticket's activity
+	// and reads the ticket back, all in one transaction guarded by the ticket
+	// still being open.
+	//
+	// It reports found=false when the guard refused (the ticket is gone or is
+	// closed), in which case nothing was written. It is one operation instead of
+	// append + touch + read because a note that is audited while the ticket's
+	// activity stays put leaves the F2 inactivity clock stale, and a note that
+	// lands after a concurrent close reopens a closed conversation.
+	AddTicketNote(ctx context.Context, note dto.TicketNoteAppend) (dto.TicketRecord, bool, error)
 
 	// ListTicketEvents returns a ticket's history, oldest first.
 	ListTicketEvents(ctx context.Context, ticketID string) ([]dto.TicketEventRecord, error)
-
-	// TouchTicket moves the ticket's updated_at to now. Activity is what resets
-	// the inactivity clock the F2 scheduler reads, so a note has to be visible on
-	// the ticket itself and not only in its history.
-	TouchTicket(ctx context.Context, id string) (bool, error)
 }
 
 // ClientDirectory is the only thing the ticket use cases need from clients: "does
@@ -101,20 +103,22 @@ const (
 
 	// MaxTicketListLimit bounds one page. The limit is an input, and an unbounded
 	// page is a way to pull every ticket of the business into an LLM context.
+	// The transport decoder enforces the same bound, so an oversized page is
+	// refused there instead of travelling one hop to be capped here.
 	MaxTicketListLimit = 50
 
-	// maxTicketMotiveLen bounds the motive of a contact. 120 runes is the
+	// MaxTicketMotiveLen bounds the motive of a contact. 120 runes is the
 	// display-name precedent of this product (maxDisplayNameLen,
 	// maxCatalogNameLen): a motive is the client's one-line statement of what they
 	// need ("me duele la espalda desde el lunes"), not a transcript — the
 	// transcript is the ticket's history, and a long text would travel into every
 	// list view whose ticket carries it.
-	maxTicketMotiveLen = 120
+	MaxTicketMotiveLen = 120
 
-	// maxTicketNoteLen bounds a note or re-engagement message. 2000 runes is the
+	// MaxTicketNoteLen bounds a note or re-engagement message. 2000 runes is the
 	// catalog's long-text bound: a paragraph is legitimate, a payload is not, and
 	// this text is stored in the event payload that every history read returns.
-	maxTicketNoteLen = 2000
+	MaxTicketNoteLen = 2000
 
 	// minMaskedDigitRun is the shortest run of digits maskPhoneRuns masks. A
 	// phone is at least 7 digits even when dialled locally, so a shorter run
@@ -137,6 +141,15 @@ var (
 	errTicketNotFound error = &SemanticError{
 		code:    CodeTicketNotFound,
 		message: "no existe un ticket con ese identificador.",
+	}
+
+	// errTicketClosed rejects any activity on a closed conversation. RF5 opens a
+	// new ticket when the client comes back: writing into the closed history
+	// would erase the boundary the re-engagement policy is built on.
+	errTicketClosed error = &SemanticError{
+		code: CodeTicketClosed,
+		message: "el ticket está cerrado: una conversación cerrada no se reabre con una nota. " +
+			"Si el cliente vuelve, se abre un ticket nuevo.",
 	}
 )
 
@@ -414,16 +427,18 @@ func normalizeTicketQuery(query dto.TicketQuery) dto.TicketQuery {
 // Cliente vuelve sobre lo mismo con un ticket abierto de ese tipo, sus mensajes
 // se agregan como eventos al ticket existente y no se crea uno nuevo".
 //
-// The use case appends the message as an event of the existing ticket and touches
-// the ticket, so it is that one open ticket that grows instead of the funnel
-// counter. Finding "the open ticket of that type" is the caller's loop (Hermes
-// lists the client's tickets with list_my_tickets and appends here); F1 does not
-// guess which conversation a message belongs to.
+// The use case appends the message as an event of the existing ticket and moves
+// its activity in ONE repository operation, so it is that one open ticket that
+// grows instead of the funnel counter. Finding "the open ticket of that type" is
+// the caller's loop (Hermes lists the client's tickets with list_my_tickets and
+// appends here); F1 does not guess which conversation a message belongs to.
 //
 // A CLOSED ticket rejects the note: "ticket nuevo solo cuando el anterior está
 // cerrado" (RF5). Reopening a closed conversation by writing into it would erase
 // the very boundary the re-engagement policy is built on, so the client is told
-// to open a new ticket instead.
+// to open a new ticket instead. That rule is enforced TWICE: read here for the
+// readable rejection, and again by the open-state guard inside the repository
+// transaction, which is what makes it hold under concurrency.
 type AddTicketNote struct {
 	tickets TicketStore
 }
@@ -437,6 +452,13 @@ func NewAddTicketNote(tickets TicketStore) (*AddTicketNote, error) {
 }
 
 // Execute appends the note and returns the ticket with its updated history.
+//
+// The authorization (ownership, caller identity) and the readable rejections are
+// decided here; the ATOMICITY belongs to the repository, which writes the event,
+// the activity of the ticket and the readback in one transaction under the
+// open-state guard. The read below is what phrases "not found" and "closed" for
+// a human, and the guard is what still holds when another actor closes the
+// ticket between that read and the write.
 func (uc *AddTicketNote) Execute(ctx context.Context, caller auth.Caller, note dto.TicketNote) (dto.TicketNoteResult, error) {
 	if err := requireTicketReader(caller); err != nil {
 		return dto.TicketNoteResult{}, err
@@ -468,8 +490,7 @@ func (uc *AddTicketNote) Execute(ctx context.Context, caller auth.Caller, note d
 	}
 
 	if ticket.State.Closed() {
-		return dto.TicketNoteResult{}, newSemanticError(CodeTicketClosed,
-			"el ticket está cerrado: una conversación cerrada no se reabre con una nota. Si el cliente vuelve, se abre un ticket nuevo.")
+		return dto.TicketNoteResult{}, errTicketClosed
 	}
 
 	payload, err := encodeTicketEventPayload(ticketNotePayload{Text: maskPhoneRuns(text)})
@@ -477,25 +498,24 @@ func (uc *AddTicketNote) Execute(ctx context.Context, caller auth.Caller, note d
 		return dto.TicketNoteResult{}, fmt.Errorf("tickets: anotar el ticket: %w", err)
 	}
 
-	if _, err := uc.tickets.AppendTicketEvent(ctx, dto.NewTicketEvent{
-		TicketID: ticket.ID,
-		Actor:    ticketActor(caller),
-		Kind:     dto.TicketEventKindNote,
-		Payload:  payload,
-	}); err != nil {
+	updated, applied, err := uc.tickets.AddTicketNote(ctx, dto.TicketNoteAppend{
+		TicketID:    ticket.ID,
+		ClosedState: dto.TicketStateClosed,
+		Event: dto.NewTicketEvent{
+			TicketID: ticket.ID,
+			Actor:    ticketActor(caller),
+			Kind:     dto.TicketEventKindNote,
+			Payload:  payload,
+		},
+	})
+	if err != nil {
 		return dto.TicketNoteResult{}, fmt.Errorf("tickets: anotar el ticket: %w", err)
 	}
-
-	if _, err := uc.tickets.TouchTicket(ctx, ticket.ID); err != nil {
-		return dto.TicketNoteResult{}, fmt.Errorf("tickets: marcar la actividad del ticket: %w", err)
-	}
-
-	updated, found, err := uc.tickets.GetTicket(ctx, ticket.ID)
-	if err != nil {
-		return dto.TicketNoteResult{}, fmt.Errorf("tickets: leer el ticket anotado: %w", err)
-	}
-	if !found {
-		return dto.TicketNoteResult{}, fmt.Errorf("tickets: el ticket %s no se encontró después de anotarlo", ticket.ID)
+	if !applied {
+		// The open-state guard refused the write: another actor closed (or removed)
+		// the ticket between the read above and the write. The rejection is the one
+		// that path already owns, never a silent insertion into a closed history.
+		return dto.TicketNoteResult{}, uc.rejectStaleNote(ctx, ticket.ID)
 	}
 
 	events, err := uc.tickets.ListTicketEvents(ctx, ticket.ID)
@@ -503,6 +523,28 @@ func (uc *AddTicketNote) Execute(ctx context.Context, caller auth.Caller, note d
 		return dto.TicketNoteResult{}, fmt.Errorf("tickets: leer el historial del ticket: %w", err)
 	}
 	return dto.TicketNoteResult{Ticket: updated, Events: events}, nil
+}
+
+// rejectStaleNote phrases the rejection of a note the open-state guard refused.
+//
+// The guard is binary (the row is open or it is not), so one more read tells
+// "closed meanwhile" apart from "gone", which is what lets the caller receive
+// the same error the pre-write check would have produced.
+func (uc *AddTicketNote) rejectStaleNote(ctx context.Context, ticketID string) error {
+	ticket, found, err := uc.tickets.GetTicket(ctx, ticketID)
+	if err != nil {
+		return fmt.Errorf("tickets: leer el ticket: %w", err)
+	}
+	if !found {
+		return errTicketNotFound
+	}
+	if ticket.State.Closed() {
+		return errTicketClosed
+	}
+	// Unreachable in F1 (the only refused state is the closed one) and kept as the
+	// honest fallback of a guard whose reason we cannot name.
+	return newSemanticError(CodeTicketStateChanged,
+		"el ticket cambió mientras lo operabas: volvé a leerlo e intentá de nuevo.")
 }
 
 // TransitionTicket is the staff transition of RF5 behind transition_ticket.
@@ -633,9 +675,9 @@ func validateTicketMotive(motive string) (string, error) {
 		return "", newSemanticError(CodeInvalidTicket,
 			"el motivo del ticket es obligatorio: un mensaje sin motivo de negocio no genera ticket.")
 	}
-	if utf8.RuneCountInString(trimmed) > maxTicketMotiveLen {
+	if utf8.RuneCountInString(trimmed) > MaxTicketMotiveLen {
 		return "", newSemanticError(CodeInvalidTicket, fmt.Sprintf(
-			"el motivo del ticket no puede superar los %d caracteres.", maxTicketMotiveLen))
+			"el motivo del ticket no puede superar los %d caracteres.", MaxTicketMotiveLen))
 	}
 	return trimmed, nil
 }
@@ -646,9 +688,9 @@ func validateTicketNoteText(text string) (string, error) {
 	if trimmed == "" {
 		return "", newSemanticError(CodeInvalidTicket, "el texto de la nota es obligatorio.")
 	}
-	if utf8.RuneCountInString(trimmed) > maxTicketNoteLen {
+	if utf8.RuneCountInString(trimmed) > MaxTicketNoteLen {
 		return "", newSemanticError(CodeInvalidTicket, fmt.Sprintf(
-			"la nota no puede superar los %d caracteres.", maxTicketNoteLen))
+			"la nota no puede superar los %d caracteres.", MaxTicketNoteLen))
 	}
 	return trimmed, nil
 }

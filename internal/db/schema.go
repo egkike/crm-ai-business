@@ -107,6 +107,23 @@ var migrations = []migration{
 			ddlCatalogItemsFTSDelete,
 		},
 	},
+	{
+		// Migration 4: the ticket activity index. The list views order by
+		// updated_at DESC, id; without this index that order is a full scan plus a
+		// sort over every ticket, which is fine at a few thousand rows and wrong at
+		// the declared ceiling (100k). Measured at the ceiling with the index: 59ms
+		// for either view, instrumented. Additive only.
+		//
+		// Known limit (R3-coverage-scope follow-up): the single list statement keeps
+		// its `(? = '' OR client_id = ?)` disjunct, so SQLite cannot use the index
+		// for the client view's seek — splitting the two views into two statements
+		// measured 14ms/2.4ms. Deferred deliberately: one statement is the current
+		// documented contract, and the index alone already clears the budget.
+		version: 4,
+		statements: []string{
+			ddlTicketsActivityIndex,
+		},
+	},
 }
 
 // Timestamps: ISO-8601 UTC with millisecond precision. Lexicographic order
@@ -384,6 +401,13 @@ CREATE INDEX tickets_client_type_idx ON tickets (client_id, ticket_type_id)`
 // and state.
 const ddlTicketsAssigneeIndex = `
 CREATE INDEX tickets_assignee_idx ON tickets (assigned_to, state)`
+
+// ddlTicketsActivityIndex serves the list views: both order by
+// (updated_at DESC, id), so the index carries exactly that pair. Without it the
+// order is a full scan plus a sort, which the declared ceiling (100k tickets)
+// turns into a measured regression — see migration 4.
+const ddlTicketsActivityIndex = `
+CREATE INDEX tickets_activity_idx ON tickets (updated_at, id)`
 
 // ddlTicketEvents is the append-only audit history of RF5: every transition,
 // note, re-engagement message and assignment change is a row with actor and
