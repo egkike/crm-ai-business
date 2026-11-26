@@ -97,6 +97,14 @@ func buildMCPHandler() (http.Handler, error) {
 	if err != nil {
 		return nil, err
 	}
+	// The handle stays open only when the composition fully succeeds; every
+	// intermediate failure closes it (review-f90b8b8884381ad5 R3-dbhandle-leak).
+	committed := false
+	defer func() {
+		if !committed {
+			_ = handle.Close()
+		}
+	}()
 
 	lookup, err := repository.NewCallerLookup(handle)
 	if err != nil {
@@ -141,7 +149,34 @@ func buildMCPHandler() (http.Handler, error) {
 		return nil, err
 	}
 
-	return mcp.NewHandler(mcp.Dependencies{
+	// Tickets (T8): repo + five usecases; the handler refuses partial ticket
+	// wiring, so all five must be present or none.
+	ticketsRepo, err := repository.NewTicketsRepo(handle)
+	if err != nil {
+		return nil, err
+	}
+	createTicket, err := usecase.NewCreateTicket(ticketsRepo, clients)
+	if err != nil {
+		return nil, err
+	}
+	listMyTickets, err := usecase.NewListMyTickets(ticketsRepo)
+	if err != nil {
+		return nil, err
+	}
+	listTickets, err := usecase.NewListTickets(ticketsRepo)
+	if err != nil {
+		return nil, err
+	}
+	addTicketNote, err := usecase.NewAddTicketNote(ticketsRepo)
+	if err != nil {
+		return nil, err
+	}
+	transitionTicket, err := usecase.NewTransitionTicket(ticketsRepo)
+	if err != nil {
+		return nil, err
+	}
+
+	handler, err := mcp.NewHandler(mcp.Dependencies{
 		CallerResolver: resolver,
 		RegisterClient: registerClient,
 		Catalog: &mcp.CatalogDependencies{
@@ -149,7 +184,19 @@ func buildMCPHandler() (http.Handler, error) {
 			Create: createCatalogItem,
 			Update: updateCatalogItem,
 		},
+		Tickets: &mcp.TicketDependencies{
+			Create:     createTicket,
+			ListMine:   listMyTickets,
+			ListAll:    listTickets,
+			AddNote:    addTicketNote,
+			Transition: transitionTicket,
+		},
 	})
+	if err != nil {
+		return nil, err
+	}
+	committed = true
+	return handler, nil
 }
 
 // resolveRegistrationLimit parses MCP_REGISTRATION_RATE_LIMIT: empty means
