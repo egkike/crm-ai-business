@@ -77,12 +77,15 @@ jobs:
           [ -n "$issues" ] || \
             fail "no issue linkage: the body must contain 'Closes #N' referencing an issue of this repository."
 
-          # 2) every linked issue exists HERE and carries status:approved
+          # 2) every linked issue exists HERE and carries status:approved.
+          #    A transient API failure (rate limit, network) must not masquerade
+          #    as "issue does not exist": retry once, then report both
+          #    possibilities honestly. The gate stays fail-closed in every case.
           for n in $issues; do
-            gh issue view "$n" --repo "$GITHUB_REPOSITORY" --json number,labels >/dev/null 2>&1 \
-              || fail "Closes #$n: issue #$n does not exist in $GITHUB_REPOSITORY."
-            gh issue view "$n" --repo "$GITHUB_REPOSITORY" --json labels \
-              -q '.labels[].name' | grep -qx 'status:approved' \
+            labels_json="$(gh issue view "$n" --repo "$GITHUB_REPOSITORY" --json labels 2>/dev/null)" \
+              || labels_json="$(gh issue view "$n" --repo "$GITHUB_REPOSITORY" --json labels 2>/dev/null)" \
+              || fail "Closes #$n: issue #$n does not exist in $GITHUB_REPOSITORY — or its validation failed twice (transient API error). If you are sure the issue exists, wait and re-run this check; do not edit a valid link."
+            printf '%s' "$labels_json" | jq -r '.labels[].name' | grep -qx 'status:approved' \
               || fail "issue #$n is linked but lacks the owner-granted 'status:approved' label."
           done
 
@@ -108,13 +111,31 @@ jobs:
           ISSUE: ${{ github.event.issue.number }}
         run: |
           set -eu
+          # Defensive bound on the spliced regex (finding from the governance
+          # review): the issue number arrives as a GitHub-typed event field,
+          # but assert digits anyway so the test() pattern can never receive
+          # an unexpected token.
+          case "$ISSUE" in ''|*[!0-9]*) \
+            echo "::warning::non-numeric issue number '$ISSUE'; nothing to re-flag" >&2; exit 0;; esac
           linked="$(gh pr list --repo "$GITHUB_REPOSITORY" --state open --limit 500 --json number,headRefOid,body \
             -q '.[] | select((.body // "") | test("(?i)\\b(closes|fixes|resolves)\\b[^0-9]*#'"$ISSUE"'\\b")) | [.number, .headRefOid] | @tsv')"
+          # An empty result must not feed the loop (a blank line would POST a
+          # check-run with an empty head_sha and abort the job), and one failed
+          # re-flag must not abort the rest — but it must not be swallowed
+          # either: a stale PASSING check does not block merge, so visibility
+          # (a red job) is the actual enforcement of the revocation.
+          failed=0
           while IFS=$'\t' read -r num sha; do
-            gh api "repos/$GITHUB_REPOSITORY/check-runs" \
+            [ -n "$num" ] || continue
+            if gh api "repos/$GITHUB_REPOSITORY/check-runs" \
               -f name="Validate issue linkage, approval, and type label" \
               -f head_sha="$sha" -f status=completed -f conclusion=failure \
               -f "output[title]=status:approved revoked on issue #$ISSUE" \
-              -f "output[summary]=Issue #$ISSUE lost the owner-granted 'status:approved' label; re-run pr-gate after re-approval." >/dev/null
-            echo "PR #$num: gate check re-flagged as failing"
+              -f "output[summary]=Issue #$ISSUE lost the owner-granted 'status:approved' label; re-run pr-gate after re-approval." >/dev/null; then
+              echo "PR #$num: gate check re-flagged as failing"
+            else
+              echo "::error::failed to re-flag PR #$num (API error) — a stale passing check does NOT block merge; re-run this job" >&2
+              failed=1
+            fi
           done <<< "$linked"
+          [ "$failed" -eq 0 ]

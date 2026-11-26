@@ -217,7 +217,9 @@ by agents. Issues follow the ask-first protocol:
 
 ### The main-ci-gate ruleset
 
-The ruleset (id **28186137**, created via `gh api` after the gate files landed on
+The ruleset (id **28186137** — environment-specific: if the ruleset is ever recreated,
+resolve the current id with `gh api repos/egkike/crm-ai-business/rulesets --jq '.[] |
+select(.name=="main-ci-gate") | .id'`; created via `gh api` after the gate files landed on
 `main`) enforces:
 PR-only into `main` (`required_approving_review_count: 0` — the owner self-merges;
 GitHub forbids self-approval anyway), the required status check `Validate issue
@@ -231,6 +233,11 @@ restore it — **capture it before touching it**:
 ```bash
 gh api repos/egkike/crm-ai-business/rulesets/28186137 > /tmp/main-ci-gate.backup.json
 ```
+
+The id in the command above is environment-specific (captured at creation, 2026-11-26);
+if the ruleset was ever recreated, resolve the current id first (lookup command in the
+first paragraph of this section) — otherwise the backup silently targets a nonexistent
+object.
 
 Relax the gate only for these three cases: (1) a required check permanently absent for
 a valid commit (try `gh run rerun <id>` first — startup failures are often transient);
