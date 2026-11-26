@@ -71,7 +71,7 @@ Quotes are VERBATIM from docs/PRD.md v1.10 — the RF text is the spec; never pa
 |---|---|---|---|
 | T1 | S8 | Go module + cmd/server mínimo + .golangci.yml + ci.yml; pipeline verde; RDD; PR; ruleset += ci | 58e02d1 (PR #8 → 677a7d1) |
 | T2 | S1 | /mcp POST-only 405 + ErrServerClosed fix + boundary tests + rider docs | (este PR) |
-| T3 | S2 | internal/auth — CallerResolver (accounts→clients→401), X-Caller-Id verbatim, anti-inyección, tests | (pend) |
+| T3 | S2 | internal/auth — CallerResolver §3.8 fail-closed, port anti-inyección, sentinels para T6 | 1999079 |
 | T4 | S2,S3 | SQLite db layer (modernc, WAL, busy_timeout, FK ON) + schema base §3.7: accounts, clients, business_profile, catalog_items, ticket_type fijo, tickets, ticket_events | (pend) |
 | T5 | S3 | register_client seam anónima + rate-limit por identificador + colisiones fail-closed + alerta posible-duplicado | (pend) |
 | T6 | S2 | Servidor MCP Streamable HTTP (go-sdk) + JSON-RPC errors (-32000/-32002/-32603) + tools/list filtrado por rol | (pend) |
@@ -100,3 +100,15 @@ Quotes are VERBATIM from docs/PRD.md v1.10 — the RF text is the spec; never pa
   POST responde 501 semántico hasta T6; plegados R3-001 (filtro ErrServerClosed +
   deadline explícito del Shutdown) y R3-002 (boundaries 1/65535); rider: este Log y
   backlog.md actualizado.
+- L6 (2026-11-26, T3): DELEGADO a gentle-ai-worker (backstop de contexto) con
+  handoff por referencia (T3/S2); worker entregó internal/auth completo (826 líneas:
+  Role/Caller/CallerLookup port/CallerError español/CallerResolver fail-closed con
+  guards de fila corrupta + 16 tests + 10 subtests, pipeline verde). Verificación
+  propia: diff revisado, boundary respetado (solo internal/auth/**), pipeline
+  re-corrido. Fixes del orquestador: mensaje canónico "no se proporcionó X-Caller-Id"
+  (contrato del repo de referencia; el worker lo había reworded por el linter) +
+  test actualizado + .golangci.yml misspell ignore-rules (clave v2; ignore-words no
+  valida) para textos españoles. SLICE: un solo commit de 838 líneas (paquete
+  único cohesivo — partirlo fragmentaría tests que referencian el paquete entero);
+  boundary registrado acá per ODD. Issue #13; PR con rider backlog (advisories T2 +
+  decisiones CallerError→domain para T4/T6).

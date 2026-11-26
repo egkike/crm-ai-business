@@ -12,6 +12,18 @@ linters:
     - unused
     - ineffassign
     - misspell
+  settings:
+    misspell:
+      # User-facing error strings are Spanish by design (AGENTS.md Coding
+      # Standards). misspell has no Spanish locale, so flag its false
+      # positives here instead of rewording canonical contract messages.
+      # Append words as new Spanish texts land — never remove a message's
+      # canonical wording to satisfy this linter.
+      ignore-rules:
+        - proporcion
+        - contextos
+        - administrar
+        - regístrate
 
 run:
   timeout: 5m

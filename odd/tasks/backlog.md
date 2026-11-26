@@ -22,3 +22,7 @@
 | R2-sleep-constant (review-10f6baa897a67c71) | pr-gate.yml: bare 5s literal in the backoff | **No action** — surrounding comment explains the intent |
 | R4-001 (review-10f6baa897a67c71) | pr-gate.yml: single fixed backoff, latency grows with linked issues | **No action** — bounded gate (seconds); revisit only if linked PRs grow large |
 | R4-002 (review-10f6baa897a67c71) | pr-gate.yml: empty ISSUE now fails vs skips — unreachable in practice (event field always set) | **No action** — out-of-domain input |
+| R3-mcp-body-assert (review-6c2652d0ceedee5c) | main_test.go: 501 subtest does not assert Content-Type: application/json | **Pending** — 1-line test addition, fold into the next cmd/server touch |
+| R3-mcp-errch-drain (review-6c2652d0ceedee5c) | run(): errCh unbuffered send can block if run() already returned with the process alive | **No action** — harmless for a leaf main; note for future refactors |
+| misspell/Spanish (T3 worker report) | .golangci.yml misspell flagged Spanish user-facing strings (no Spanish locale) | **Fixed** — T3 PR: misspell `ignore-rules` (v2 key; `ignore-words` does not validate) |
+| CallerError placement (T3 worker report) | CallerError lives in internal/auth; internal/domain does not exist yet | **Decision pending T4** — map into domain.SemanticError or keep Code() contract; T6 must not lose Code() |
