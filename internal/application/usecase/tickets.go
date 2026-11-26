@@ -659,8 +659,8 @@ func invalidTicketStateError(message string) error {
 	return newSemanticError(CodeInvalidTicketState, message)
 }
 
-// maskPhoneRuns masks every digit run long enough to be a phone number, keeping
-// its last maskedSuffixDigits digits ("+5491155550000" → "****0000").
+// maskPhoneRuns masks every digit cluster long enough to be a phone number,
+// keeping its last maskedSuffixDigits digits ("+5491155550000" → "****0000").
 //
 // It exists because the free text a human writes lands in the audit (the motive of
 // the contact, the body of a note) and AGENTS.md forbids retaining raw PII in an
@@ -668,10 +668,16 @@ func invalidTicketStateError(message string) error {
 // caller-supplied text is never trusted to carry a mask of its own: whatever the
 // client typed is re-masked here.
 //
-// It is a heuristic, and the honest limits are worth stating: a phone split across
-// separators ("11 5555-0000") is masked per run, and a long number that is not a
-// phone (a 12-digit reference) is masked too. Over-masking a number in an audit
-// note is the safe direction; retaining a phone verbatim is not.
+// It is a heuristic, and the honest limits are worth stating: masking works on
+// digit CLUSTERS, not isolated runs — a phone split across separators
+// ("9 11 5555-0000", runs of 1/2/4/4) is one cluster and is masked as a whole
+// (correction R3-mask-split-run: per-run masking left separator-split phones
+// verbatim). A cluster is a maximal span of digits interleaved with common phone
+// separators (space, dash, dot, parentheses, slash, plus) whose TOTAL digit count
+// reaches the threshold; its digits keep the last 4 and mask the rest, separators
+// stay as written. A long number that is not a phone (a 12-digit reference) is
+// masked too. Over-masking a number in an audit note is the safe direction;
+// retaining a phone verbatim is not.
 func maskPhoneRuns(text string) string {
 	runes := []rune(text)
 	var builder strings.Builder
@@ -683,16 +689,54 @@ func maskPhoneRuns(text string) string {
 			index++
 			continue
 		}
-		start := index
-		for index < len(runes) && unicode.IsDigit(runes[index]) {
-			index++
+		// Grow the cluster: digits interleaved with common phone separators.
+		end := index
+		digits := 0
+		for end < len(runes) {
+			if unicode.IsDigit(runes[end]) {
+				digits++
+				end++
+				continue
+			}
+			if end+1 < len(runes) && unicode.IsDigit(runes[end+1]) && isPhoneSeparator(runes[end]) {
+				end++
+				continue
+			}
+			break
 		}
-		digits := string(runes[start:index])
-		if len([]rune(digits)) < minMaskedDigitRun {
-			builder.WriteString(digits)
+		if digits < minMaskedDigitRun {
+			// Not phone-shaped as a whole: copy the cluster verbatim.
+			builder.WriteString(string(runes[index:end]))
+			index = end
 			continue
 		}
-		builder.WriteString(maskedSuffix(digits, maskedSuffixDigits))
+		// Mask the cluster keeping its LAST 4 digits; separators stay as written.
+		digitIndex := 0
+		var cluster strings.Builder
+		for scan := index; scan < end; scan++ {
+			if unicode.IsDigit(runes[scan]) {
+				if digits-digitIndex <= maskedSuffixDigits {
+					cluster.WriteRune(runes[scan])
+				} else {
+					cluster.WriteRune('*')
+				}
+				digitIndex++
+			} else {
+				cluster.WriteRune(runes[scan])
+			}
+		}
+		builder.WriteString(cluster.String())
+		index = end
 	}
 	return builder.String()
+}
+
+// isPhoneSeparator reports whether a rune commonly separates phone digit groups.
+// Slash is deliberately absent: dates like 26/11/2026 are not phone clusters.
+func isPhoneSeparator(r rune) bool {
+	switch r {
+	case ' ', '-', '.', '(', ')', '+':
+		return true
+	}
+	return false
 }

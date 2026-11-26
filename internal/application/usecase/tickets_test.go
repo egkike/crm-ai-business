@@ -479,7 +479,52 @@ func TestCreateTicketMasksPhonesInTheAudit(t *testing.T) {
 	}
 	// The rest of the message survives: masking is not truncation.
 	if !strings.Contains(motive, "llamame al") || !strings.Contains(motive, "por favor") {
-		t.Fatalf("motive = %q, se esperaba el texto alrededor del teléfono", motive)
+		t.Fatalf("motive = %q, el texto alrededor del teléfono debe sobrevivir", motive)
+	}
+}
+
+// TestCreateTicketMasksSplitPhones pins the correction R3-mask-split-run: a phone
+// written with separators ("9 11 5555-0000", digit runs of 1/2/4/4) is ONE cluster
+// and is masked as a whole — per-run masking left it verbatim in the audit.
+func TestCreateTicketMasksSplitPhones(t *testing.T) {
+	store := newFakeTickets()
+	uc := createTicketUC(t, store, newFakeClientDirectory(clientA))
+
+	result, err := uc.Execute(context.Background(), ticketCaller(clientA, auth.RoleClient), dto.CreateTicketCommand{
+		Motive: "mi numero es 9 11 5555-0000 llamenme",
+	})
+	if err != nil {
+		t.Fatalf("Execute() error inesperado: %v", err)
+	}
+
+	payload := payloadOf(t, result.Events[0].Payload)
+	motive, _ := payload["motive"].(string)
+	if strings.Contains(motive, "5555") || strings.Contains(motive, "9 11") {
+		t.Fatalf("motive = %q, el teléfono partido por separadores debe quedar enmascarado", motive)
+	}
+	if !strings.Contains(motive, "****-0000") {
+		t.Fatalf("motive = %q, se esperaba el cluster enmascarado con los últimos 4 dígitos", motive)
+	}
+}
+
+// TestCreateTicketKeepsShortNumbers pins the cluster threshold: short digit
+// groups below the phone threshold stay verbatim (a date, a quantity, a street
+// number) — masking is for phone-shaped clusters only.
+func TestCreateTicketKeepsShortNumbers(t *testing.T) {
+	store := newFakeTickets()
+	uc := createTicketUC(t, store, newFakeClientDirectory(clientA))
+
+	result, err := uc.Execute(context.Background(), ticketCaller(clientA, auth.RoleClient), dto.CreateTicketCommand{
+		Motive: "compre 3 articulos el 26/11/2026 en la calle 1234",
+	})
+	if err != nil {
+		t.Fatalf("Execute() error inesperado: %v", err)
+	}
+
+	payload := payloadOf(t, result.Events[0].Payload)
+	motive, _ := payload["motive"].(string)
+	if !strings.Contains(motive, "3 articulos") || !strings.Contains(motive, "26/11/2026") || !strings.Contains(motive, "calle 1234") {
+		t.Fatalf("motive = %q, los números cortos no-phone deben sobrevivir verbatim", motive)
 	}
 }
 
