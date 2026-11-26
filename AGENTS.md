@@ -147,6 +147,37 @@ Development with work-unit commits on feature branches; review authority follows
 native review lifecycle. Never commit with `--no-verify`; if a gate blocks and the finding
 is ambiguous, stop and hand back with the evidence.
 
+## Verification & Review Protocol (RDD — mandatory)
+
+Receipt-driven development is ON for this repository. This section is the enforcement
+summary — the native lifecycle owns the mechanics; these rules bind the agent.
+
+1. **The assess is never skipped.** After authorized source-mutating implementation is
+   complete and normalized — and before reporting it complete — run the native review
+   assess over the candidate. Reporting a work unit complete without its assess is a
+   process defect, whatever the change type.
+2. **`reviewDue: true` → the review runs.** No exceptions. Lenses per what was touched
+   and how; tier, budgets and corrections are native-owned.
+3. **`reviewDue: false` → routing by surface:**
+   - **Pure documentation** (prose `.md` with no executable surface): the gate is the
+     full pipeline plus a structural readback; no review run.
+   - **Everything else** — Go code, workflows, schemas, issue forms, and the
+     contract-authority docs agents consume (`AGENTS.md`, ADRs): the pipeline is the
+     floor gate, and the agent surfaces the candidate and its assess to the owner; the
+     owner's explicit request enables a review the assess did not make due. Until CI
+     (`ci.yml`, Phase 1) and tests cover the changed surface, default to asking.
+4. **Risk ≠ authority.** An RDD authority reminder (a candidate without a receipt)
+   prevails over `reviewDue`: inspect/start even when the assess said not due. The only
+   clean bypass is the owner's explicit disposition for that exact candidate.
+5. **Corrections are native-owned.** A correction plan precedes the edit
+   (`correctionLines` counts diff lines: one replaced line = 2); the edit maps only to
+   corroborated frozen findings; targeted validation closes it. Collect bindings are
+   byte-exact — never retype them; if the facade rejects a binding whose values are
+   correct, resume via `gentle_review_run` (`lineageId` + the exact original `baseRef`)
+   or the native `capture-validation` CLI, never a fresh lineage.
+6. **A review outcome never authorizes delivery.** Push, PR and merge follow ordinary
+   repository policy.
+
 ## Branch & Commit Strategy
 
 - **No direct pushes to `main`.** Every change lands through a feature branch and a pull
