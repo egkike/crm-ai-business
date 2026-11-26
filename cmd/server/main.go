@@ -17,10 +17,22 @@ import (
 	"strconv"
 	"syscall"
 	"time"
+
+	"github.com/egkike/crm-ai-business/internal/application/usecase"
+	crmauth "github.com/egkike/crm-ai-business/internal/auth"
+	"github.com/egkike/crm-ai-business/internal/db"
+	"github.com/egkike/crm-ai-business/internal/mcp"
+	"github.com/egkike/crm-ai-business/internal/repository"
 )
 
 const (
-	defaultPort     = 3001
+	defaultPort = 3001
+
+	// registrationLimitEnv bounds anonymous registrations per identifier
+	// (the T5 usecase owns the window semantics; this is only wiring).
+	registrationLimitEnv     = "MCP_REGISTRATION_RATE_LIMIT"
+	defaultRegistrationLimit = 10
+
 	shutdownTimeout = 5 * time.Second
 )
 
@@ -36,7 +48,15 @@ func run() error {
 		return err
 	}
 
-	srv := newServer(port)
+	// Composition root: DB + adapters + usecases + transport. No business
+	// rules live here — each piece refuses its own invalid configuration
+	// (fail-closed) and run() propagates.
+	handler, err := buildMCPHandler()
+	if err != nil {
+		return err
+	}
+
+	srv := newServer(port, handler)
 
 	errCh := make(chan error, 1)
 	go func() { errCh <- srv.ListenAndServe() }()
@@ -64,14 +84,81 @@ func run() error {
 	}
 }
 
+// buildMCPHandler composes the F1 application: SQLite (canonical DDL +
+// migrations), the identity chain (CallerLookup adapter + resolver), the
+// anonymous registration seam (clients repo + rate limiter) and the MCP
+// transport. Every constructor failure refuses to start the server.
+func buildMCPHandler() (http.Handler, error) {
+	dbPath, err := db.ResolvePath(os.Getenv(db.EnvPath))
+	if err != nil {
+		return nil, err
+	}
+	handle, err := db.Open(context.Background(), dbPath)
+	if err != nil {
+		return nil, err
+	}
+
+	lookup, err := repository.NewCallerLookup(handle)
+	if err != nil {
+		return nil, err
+	}
+	resolver, err := crmauth.NewCallerResolver(lookup)
+	if err != nil {
+		return nil, err
+	}
+
+	clients, err := repository.NewClientsRepo(handle)
+	if err != nil {
+		return nil, err
+	}
+	limit, err := resolveRegistrationLimit(os.Getenv(registrationLimitEnv))
+	if err != nil {
+		return nil, err
+	}
+	// clients implements both ClientStore and AccountIdentifierChecker; the
+	// duplicate notifier is the F2 seam (default no-op inside the usecase).
+	registerClient, err := usecase.NewRegisterClient(clients, clients, usecase.NewMemoryRegistrationLimiter(limit), nil)
+	if err != nil {
+		return nil, err
+	}
+
+	return mcp.NewHandler(mcp.Dependencies{
+		CallerResolver: resolver,
+		RegisterClient: registerClient,
+	})
+}
+
+// resolveRegistrationLimit parses MCP_REGISTRATION_RATE_LIMIT: empty means
+// the default; 0 disables anonymous registration entirely (fail-closed by
+// design); anything non-numeric or negative refuses to start.
+func resolveRegistrationLimit(raw string) (int, error) {
+	if raw == "" {
+		return defaultRegistrationLimit, nil
+	}
+	limit, err := strconv.Atoi(raw)
+	if err != nil || limit < 0 {
+		return 0, fmt.Errorf("MCP_REGISTRATION_RATE_LIMIT inválido: %q (se espera 0 o un entero positivo; 0 deshabilita el registro)", raw)
+	}
+	return limit, nil
+}
+
 // newServer builds the loopback HTTP server. The address is a constant
 // invariant (AGENTS.md: loopback-only); only the port varies.
-func newServer(port int) *http.Server {
+func newServer(port int, mcpHandler http.Handler) *http.Server {
 	return &http.Server{
 		Addr:              fmt.Sprintf("127.0.0.1:%d", port),
-		Handler:           newMux(),
+		Handler:           newMux(mcpHandler),
 		ReadHeaderTimeout: 5 * time.Second,
 	}
+}
+
+// newMux builds the HTTP surface: /healthz liveness and the MCP handler
+// mounted at /mcp (the handler owns the POST-only 405 semantics — T6).
+func newMux(mcpHandler http.Handler) *http.ServeMux {
+	mux := http.NewServeMux()
+	mux.HandleFunc("/healthz", healthHandler)
+	mux.Handle("/mcp", mcpHandler)
+	return mux
 }
 
 // resolvePort parses MCP_PORT; empty means the default. An invalid value is a
@@ -85,30 +172,6 @@ func resolvePort(raw string) (int, error) {
 		return 0, fmt.Errorf("MCP_PORT inválido: %q (se espera 1-65535)", raw)
 	}
 	return port, nil
-}
-
-// newMux builds the HTTP surface. T2 adds the MCP endpoint's HTTP-edge
-// contract: POST-only — non-POST methods answer 405 by design.
-func newMux() *http.ServeMux {
-	mux := http.NewServeMux()
-	mux.HandleFunc("/healthz", healthHandler)
-	mux.HandleFunc("/mcp", mcpHandler)
-	return mux
-}
-
-// mcpHandler pins the transport contract at the HTTP edge (RF1): the MCP
-// endpoint accepts POST only — GET answers 405 with the Allow header. The
-// MCP protocol itself lands with T6; until then a POST answers 501 with a
-// semantic message instead of pretending to speak MCP.
-func mcpHandler(w http.ResponseWriter, r *http.Request) {
-	if r.Method != http.MethodPost {
-		w.Header().Set("Allow", http.MethodPost)
-		w.WriteHeader(http.StatusMethodNotAllowed)
-		return
-	}
-	w.Header().Set("Content-Type", "application/json")
-	w.WriteHeader(http.StatusNotImplemented)
-	_, _ = w.Write([]byte(`{"error":"el endpoint MCP aún no está implementado; llega con la tarea T6"}`))
 }
 
 func healthHandler(w http.ResponseWriter, _ *http.Request) {

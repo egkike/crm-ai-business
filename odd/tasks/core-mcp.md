@@ -74,7 +74,7 @@ Quotes are VERBATIM from docs/PRD.md v1.10 — the RF text is the spec; never pa
 | T3 | S2 | internal/auth — CallerResolver §3.8 fail-closed, port anti-inyección, sentinels para T6 | 1999079 |
 | T4 | S2,S3 | SQLite db layer + migration runner append-only + F1 schema (option B) + CallerLookup adapter | (este PR) |
 | T5 | S3 | register_client usecase + clients repo + rate limiter + seam F2 | (este PR) |
-| T6 | S2 | Servidor MCP Streamable HTTP (go-sdk) + JSON-RPC errors (-32000/-32002/-32603) + tools/list filtrado por rol | (pend) |
+| T6 | S1,S2,S3 | MCP Streamable HTTP (SDK v1.7.0) + X-Caller-Id middleware + role-gated registry + composition wiring | (este PR) |
 | T7 | S4 | catalog_items + search_catalog (FTS5) | (pend) |
 | T8 | S5 | Tickets tipo fijo + ticket_events auditados + re-engagement + transición por staff | (pend) |
 | T9 | S6,S7 | Skill template (doctrina resolutiva) + doc de pairing (WA verificado + verificación e-mail) | (pend) |
@@ -139,4 +139,24 @@ Quotes are VERBATIM from docs/PRD.md v1.10 — the RF text is the spec; never pa
   con admisión). 99 tests PASS -race. Worker status PARTIAL honesto: bloqueado solo
   por misspell 'clientes' (24 hits) fuera de su surface → fix orquestador (ignore-rules
   += clientes, tercera palabra del patrón). Desviación aceptada: guard >254 bytes
-  (validación de args per AGENTS). SLICE: commit único cohesivo. Issue #19.
+  (validación de args per AGENTS). SLICE: commit único cohesivo. Issue #19. MERGED
+  e85a352 (PR #20, review-923a035dd8dd3224 APPROVED/burned, 4 advisories triaged:
+  oracle RESUELTO por owner con threat model documentado).
+- L10 (2026-11-26, T6): DELEGADO (4ª) a gentle-ai-worker: internal/mcp — servidor
+  MCP Streamable HTTP sobre SDK oficial v1.7.0 (stateless + JSONResponse —
+  identidad per-request by construction), middleware X-Caller-Id verbatim →
+  CallerResolver → -32000 con Code() en data, register_client como seam anónima
+  (schema additionalProperties:false, caller-id del context jamás del body),
+  role-gated registry (tools/list + tools/call gating; sample owner-only tool
+  pinnear S2), sanitización ejecutable -32000/-32002/-32603 (CIERRE del advisory
+  R3-001 de T3: internals jamás al wire, test con puerto fallando), 405 non-POST
+  con Allow. 21 tests / 40 subtests. WIRING INLINE DEL ORQUESTADOR (mi mitad de
+  T6): buildMCPHandler en cmd/server (db.ResolvePath/Open → CallerLookup →
+  resolver → ClientsRepo → resolveRegistrationLimit fail-closed (MCP_REGISTRATION_
+  RATE_LIMIT: empty=10, 0=disable, inválido=refuse) → RegisterClient →
+  mcp.NewHandler → newMux mounts), stub 501 RETIRADO (el handler propio posee los
+  405), tests del composition actualizados (routing + registration limit + loopback).
+  Fixes orquestador: misspell += conversacional, argumentos (5ª y 6ª palabras).
+  ORÁCULO RESUELTO PREVIO por el owner: mensajes distintivos + trade-off documentado
+  (X-Caller-Id inyectado por gateway confiable). SLICE: worker+mío en un commit
+  (unidad transport+wiring inseparable). Issue #21.

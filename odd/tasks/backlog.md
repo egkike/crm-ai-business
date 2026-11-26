@@ -45,3 +45,8 @@
 | R2-001 (review-31ae9e99067acc33) | lookupAccount/lookupClient/findAccount/findClient structural duplicates (4 places) | **Post-F1 refactor sweep** — unify helpers in a type:refactor work-unit |
 | R3-002 (review-31ae9e99067acc33) | ErrCallerNotFound sentinel reused across 4 queries — 'no match' vs 'table absent' needs query order to distinguish | **Post-F1 refactor sweep** — same pass as R2-001 |
 | misspell/clientes (T5 worker report) | `clientes` flagged as an English misspelling (24 hits) | **Fixed** — T5: added to misspell ignore-rules (third Spanish word; pattern: add, never reword canonical strings) |
+| R1-displayname-unbounded (review-923a035dd8dd3224) | register_client accepts a DisplayName of unbounded length before insertion | **Pending** — add a MaxDisplayNameLen guard; fold into the next internal/application touch (T7/T8 rider) |
+| R1-enum-oracle (review-923a035dd8dd3224) | distinct registration rejections let a gateway-controlling prober map internal identifiers | **Resolved by owner** — keep distinct messages (honest UX, predecessor contract); threat model documented: X-Caller-Id is injected by the trusted loopback gateway, senders cannot present arbitrary identifiers |
+| R3-001 (review-923a035dd8dd3224) | same unbounded display_name (duplicate of the risk finding) | **Pending** — same fix as R1-displayname-unbounded |
+| R3-002 (review-923a035dd8dd3224) | limiter budget burned by attempts that fail after admission | **No action** — fail-closed by design; retry-UX note for the F2 scheduler backlog |
+| misspell/conversacional+argumentos (T6 worker report) | two more Spanish words flagged | **Fixed** — T6: added to misspell ignore-rules (fifth and sixth words) |

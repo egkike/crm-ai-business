@@ -26,6 +26,8 @@ linters:
         - regístrate
         - producto
         - clientes
+        - conversacional
+        - argumentos
 
 run:
   timeout: 5m
