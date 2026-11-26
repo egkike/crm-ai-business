@@ -47,6 +47,33 @@ const (
 	CodeCatalogItemNotFound ErrorCode = "catalog_item_not_found"
 )
 
+// The semantic failures of the RF5 tickets.
+const (
+	// CodeInvalidTicket: a ticket input violates its rule (no motive, no note
+	// text, oversized text, no ticket id).
+	CodeInvalidTicket ErrorCode = "invalid_ticket"
+
+	// CodeInvalidTicketState: the requested state is outside the F1 vocabulary,
+	// or it is the state the ticket is already in.
+	CodeInvalidTicketState ErrorCode = "invalid_ticket_state"
+
+	// CodeTicketNotFound: no visible ticket carries that id. It is also the
+	// answer to a client naming someone else's ticket: the rejection does not
+	// confirm that the ticket exists (no oracle).
+	CodeTicketNotFound ErrorCode = "ticket_not_found"
+
+	// CodeTicketClosed: the ticket's conversation is closed, so it accepts no
+	// further notes (RF5: a closed ticket is not re-engagement, it is history).
+	CodeTicketClosed ErrorCode = "ticket_closed"
+
+	// CodeTicketStateChanged: the ticket moved between the read and the write,
+	// so the guarded transition did not apply.
+	CodeTicketStateChanged ErrorCode = "ticket_state_changed"
+
+	// CodeClientNotFound: the ticket names a client no row carries.
+	CodeClientNotFound ErrorCode = "client_not_found"
+)
+
 // SemanticError is the application layer's user-facing failure.
 //
 // Its Message is the only text that may cross the sanitization boundary

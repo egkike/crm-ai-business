@@ -30,6 +30,7 @@ linters:
         - argumentos
         - problemas
         - columnas
+        - transicion
 
 run:
   timeout: 5m
