@@ -73,7 +73,7 @@ Quotes are VERBATIM from docs/PRD.md v1.10 — the RF text is the spec; never pa
 | T2 | S1 | /mcp POST-only 405 + ErrServerClosed fix + boundary tests + rider docs | (este PR) |
 | T3 | S2 | internal/auth — CallerResolver §3.8 fail-closed, port anti-inyección, sentinels para T6 | 1999079 |
 | T4 | S2,S3 | SQLite db layer + migration runner append-only + F1 schema (option B) + CallerLookup adapter | (este PR) |
-| T5 | S3 | register_client seam anónima + rate-limit por identificador + colisiones fail-closed + alerta posible-duplicado | (pend) |
+| T5 | S3 | register_client usecase + clients repo + rate limiter + seam F2 | (este PR) |
 | T6 | S2 | Servidor MCP Streamable HTTP (go-sdk) + JSON-RPC errors (-32000/-32002/-32603) + tools/list filtrado por rol | (pend) |
 | T7 | S4 | catalog_items + search_catalog (FTS5) | (pend) |
 | T8 | S5 | Tickets tipo fijo + ticket_events auditados + re-engagement + transición por staff | (pend) |
@@ -125,4 +125,18 @@ Quotes are VERBATIM from docs/PRD.md v1.10 — the RF text is the spec; never pa
   deferrals documentados por fase. Fixes del orquestador: doc del port auth alineado
   a §3.8 accounts-first, misspell += producto (nolint del worker dropeado). SLICE:
   un solo commit (unidad schema+migración+adapter inseparable); boundary registrado.
-  Issue #17; PR con rider backlog (6 advisories T3 + fixes).
+  Issue #17; PR con rider backlog (6 advisories T3 + fixes). MERGED 44e9654 (PR #18,
+  review-31ae9e99067acc33 APPROVED/burned, 10 advisories triaged en backlog).
+- L9 (2026-11-26, T5): DELEGADO (3ª) a gentle-ai-worker: primer código de la capa
+  application — RegisterClient usecase (seam anónima: identidad SOLO del caller-id,
+  sin parámetro de rol por diseño; cadena empty→254bytes→limiter→accounts→pre-check→
+  insert; colisiones fail-closed mapeadas a semántico español; NUNCA auto-vincula;
+  DuplicateNotifier seam documentado para F2 con claimingClientID='' en la seam
+  anónima) + dto carriers + MemoryRegistrationLimiter (0=disabled fail-closed, clock
+  inyectado, bound 100k) + ClientsRepo (UNIQUE exact+lower(email) clasificados, PK
+  1555 queda error interno) + RIDER R2-002 (comentario mentiroso corregido, behavior
+  intacto) + E2E: resolver-unknown→register→resolver-resuelve (la cadena §3.8 cierra
+  con admisión). 99 tests PASS -race. Worker status PARTIAL honesto: bloqueado solo
+  por misspell 'clientes' (24 hits) fuera de su surface → fix orquestador (ignore-rules
+  += clientes, tercera palabra del patrón). Desviación aceptada: guard >254 bytes
+  (validación de args per AGENTS). SLICE: commit único cohesivo. Issue #19.
