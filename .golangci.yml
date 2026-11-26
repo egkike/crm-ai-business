@@ -25,6 +25,7 @@ linters:
         - administrar
         - regístrate
         - producto
+        - clientes
 
 run:
   timeout: 5m

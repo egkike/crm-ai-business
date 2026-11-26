@@ -255,7 +255,14 @@ func TestLookupNotFound(t *testing.T) {
 }
 
 // TestLookupEmptyCallerIDFailsClosed pins the defensive guard: an empty
-// caller-id never matches a row (not even a malformed one that stored ”).
+// caller-id is rejected before any query, so it can never match a row.
+//
+// Note what the fixture does NOT do: phone "" becomes SQL NULL through nullable,
+// so this test never creates the empty-string row the guard protects against —
+// what it pins is the guard itself (callerID == "" is answered with
+// ErrCallerNotFound without touching the table). Reaching the real hazard would
+// take a hand-edited file with phone = ”, which is exactly the row the guard
+// keeps from being resolved to a request that carried no identity.
 func TestLookupEmptyCallerIDFailsClosed(t *testing.T) {
 	handle := openDB(t)
 	seedAccount(t, handle, account{id: uuid(50), phone: "", email: "sin-telefono@example.com", role: "staff", active: true, name: "Sin teléfono"})
