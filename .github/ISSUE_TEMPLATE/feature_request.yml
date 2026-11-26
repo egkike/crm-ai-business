@@ -6,11 +6,8 @@ body:
   - type: markdown
     attributes:
       value: |
-        ## How this repository works
-
-        This project accepts **issues only** — pull requests are closed
-        automatically. Reporting the request here is the whole contribution; the
-        maintainer implements it if it is accepted. See
+        This project takes **issues only**; pull requests are closed automatically and
+        the maintainer implements accepted work. Full policy:
         [CONTRIBUTING.md](https://github.com/egkike/crm-ai-business/blob/main/CONTRIBUTING.md).
 
   - type: checkboxes
