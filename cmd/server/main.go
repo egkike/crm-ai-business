@@ -8,6 +8,7 @@ package main
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log"
 	"net/http"
@@ -18,7 +19,10 @@ import (
 	"time"
 )
 
-const defaultPort = 3001
+const (
+	defaultPort     = 3001
+	shutdownTimeout = 5 * time.Second
+)
 
 func main() {
 	if err := run(); err != nil {
@@ -43,10 +47,19 @@ func run() error {
 	select {
 	case sig := <-stop:
 		log.Printf("crm-ai-business: señal %s, cerrando", sig)
-		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		ctx, cancel := context.WithTimeout(context.Background(), shutdownTimeout)
 		defer cancel()
-		return srv.Shutdown(ctx)
+		if err := srv.Shutdown(ctx); err != nil && !errors.Is(err, context.DeadlineExceeded) {
+			return err
+		}
+		// DeadlineExceeded means some connections outlived the window; the
+		// listener is closed either way — exit clean, not as a failure.
+		return nil
 	case err := <-errCh:
+		// ErrServerClosed only means Shutdown won the race — never a failure.
+		if errors.Is(err, http.ErrServerClosed) {
+			return nil
+		}
 		return err
 	}
 }
@@ -74,12 +87,28 @@ func resolvePort(raw string) (int, error) {
 	return port, nil
 }
 
-// newMux builds the HTTP surface. Phase 1 T1 ships only the liveness probe;
-// /mcp (POST-only, 405 by design) lands with the MCP server task.
+// newMux builds the HTTP surface. T2 adds the MCP endpoint's HTTP-edge
+// contract: POST-only — non-POST methods answer 405 by design.
 func newMux() *http.ServeMux {
 	mux := http.NewServeMux()
 	mux.HandleFunc("/healthz", healthHandler)
+	mux.HandleFunc("/mcp", mcpHandler)
 	return mux
+}
+
+// mcpHandler pins the transport contract at the HTTP edge (RF1): the MCP
+// endpoint accepts POST only — GET answers 405 with the Allow header. The
+// MCP protocol itself lands with T6; until then a POST answers 501 with a
+// semantic message instead of pretending to speak MCP.
+func mcpHandler(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		w.Header().Set("Allow", http.MethodPost)
+		w.WriteHeader(http.StatusMethodNotAllowed)
+		return
+	}
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(http.StatusNotImplemented)
+	_, _ = w.Write([]byte(`{"error":"el endpoint MCP aún no está implementado; llega con la tarea T6"}`))
 }
 
 func healthHandler(w http.ResponseWriter, _ *http.Request) {

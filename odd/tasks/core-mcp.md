@@ -69,8 +69,8 @@ Quotes are VERBATIM from docs/PRD.md v1.10 — the RF text is the spec; never pa
 
 | ID | Specs | Route | Commit |
 |---|---|---|---|
-| T1 | S8 | Go module + cmd/server mínimo + .golangci.yml + ci.yml; pipeline verde; RDD; PR; ruleset += ci | 58e02d1 |
-| T2 | S1 | Server HTTP loopback :3001 — /healthz 200, /mcp 405 POST-only, config fail-closed | (pend) |
+| T1 | S8 | Go module + cmd/server mínimo + .golangci.yml + ci.yml; pipeline verde; RDD; PR; ruleset += ci | 58e02d1 (PR #8 → 677a7d1) |
+| T2 | S1 | /mcp POST-only 405 + ErrServerClosed fix + boundary tests + rider docs | (este PR) |
 | T3 | S2 | internal/auth — CallerResolver (accounts→clients→401), X-Caller-Id verbatim, anti-inyección, tests | (pend) |
 | T4 | S2,S3 | SQLite db layer (modernc, WAL, busy_timeout, FK ON) + schema base §3.7: accounts, clients, business_profile, catalog_items, ticket_type fijo, tickets, ticket_events | (pend) |
 | T5 | S3 | register_client seam anónima + rate-limit por identificador + colisiones fail-closed + alerta posible-duplicado | (pend) |
@@ -89,3 +89,14 @@ Quotes are VERBATIM from docs/PRD.md v1.10 — the RF text is the spec; never pa
   aprobado; commit 58e02d1 en feat/f1-t1-ci-foundation con pipeline local verde
   (gofmt/vet/lint 0 issues/build/test -race 10 PASS). Nota técnica: golangci-lint v2
   no acepta gosimple (fusionado en staticcheck) — corregido en .golangci.yml.
+- L3 (2026-11-26, T1 merge): PR #8 squash-mergeado como 677a7d1 (Closes #7); CI de
+  GitHub verde en su primera corrida (1m11s, run 45884152670); ruleset main-ci-gate
+  actualizado: required checks = pr-gate + ci (backup previo, read-back verificado).
+  Review T1 (review-15ebf00d81654095) APPROVED/burned; advisories triaged en
+  odd/tasks/backlog.md (sweep 1 ya mergeado como 421b8a1, PR #10).
+- L4 (2026-11-26, sweep): advisories de gobernanza barridos en PR #10 (421b8a1,
+  Closes #9, review-10f6baa897a67c71 APPROVED/burned); backlog doc creado.
+- L5 (2026-11-26, T2): issue #11 aprobado; /mcp POST-only con Allow header (405),
+  POST responde 501 semántico hasta T6; plegados R3-001 (filtro ErrServerClosed +
+  deadline explícito del Shutdown) y R3-002 (boundaries 1/65535); rider: este Log y
+  backlog.md actualizado.
