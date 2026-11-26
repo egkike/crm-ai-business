@@ -170,7 +170,8 @@ summary — the native lifecycle owns the mechanics; these rules bind the agent.
    prevails over `reviewDue`: inspect/start even when the assess said not due. The only
    clean bypass is the owner's explicit disposition for that exact candidate.
 5. **Corrections are native-owned.** A correction plan precedes the edit
-   (`correctionLines` counts diff lines: one replaced line = 2); the edit maps only to
+   (`correctionLines` counts diff lines — a replaced line is one deletion plus one
+   addition, hence 2); the edit maps only to
    corroborated frozen findings; targeted validation closes it. Collect bindings are
    byte-exact — never retype them; if the facade rejects a binding whose values are
    correct, resume via `gentle_review_run` (`lineageId` + the exact original `baseRef`)
@@ -265,10 +266,9 @@ restore it — **capture it before touching it**:
 gh api repos/egkike/crm-ai-business/rulesets/28186137 > /tmp/main-ci-gate.backup.json
 ```
 
-The id in the command above is environment-specific (captured at creation, 2026-11-26);
-if the ruleset was ever recreated, resolve the current id first (lookup command in the
-first paragraph of this section) — otherwise the backup silently targets a nonexistent
-object.
+The id is environment-specific (captured at creation, 2026-11-26) — if the ruleset was
+recreated, resolve the current id with the lookup in this section's first paragraph
+before running the command.
 
 Relax the gate only for these three cases: (1) a required check permanently absent for
 a valid commit (try `gh run rerun <id>` first — startup failures are often transient);
