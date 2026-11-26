@@ -4,6 +4,14 @@
 
 <div align="center">
 
+<a href="https://github.com/Gentleman-Programming/gentle-ai">
+  <img width="180" src="https://raw.githubusercontent.com/Gentleman-Programming/gentle-ai/main/docs/assets/brand/built-with-gentle-ai.png" alt="Built with Gentle-AI" />
+</a>
+
+</div>
+
+<div align="center">
+
 🚧 **Pre-alpha — definition phase closed, implementation starting.** The canonical
 requirements document ([`docs/PRD.md`](./docs/PRD.md), Spanish) is approved and closed for
 revision; Phase 1 (`core-mcp`) is the first implementation phase. No code is released yet:
