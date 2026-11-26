@@ -43,9 +43,12 @@ type Identity struct {
 //
 // The signature is the anti-injection guarantee: there is no parameter — and
 // no implementation may add one — through which the caller could hint, claim
-// or override a role. The implementation lands with T4 (SQLite: exact match on
-// clients.phone from WhatsApp, case-insensitive match on clients.email from
-// e-mail, then accounts).
+// or override a role. The PRD §3.8 chain is ACCOUNTS FIRST: an accounts row
+// wins over a clients row for the same identifier, because an account carries
+// an internal role while a client row resolves to role client. The SQLite
+// adapter (T4) matches accounts.phone byte-exact / accounts.email
+// case-insensitively, then clients (clients.phone byte-exact, clients.email
+// case-insensitively).
 type CallerLookup interface {
 	LookupCaller(ctx context.Context, callerID string) (Identity, error)
 }
