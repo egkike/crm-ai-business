@@ -24,6 +24,7 @@ linters:
         - contextos
         - administrar
         - regístrate
+        - producto
 
 run:
   timeout: 5m
