@@ -75,7 +75,7 @@ Quotes are VERBATIM from docs/PRD.md v1.10 — the RF text is the spec; never pa
 | T4 | S2,S3 | SQLite db layer + migration runner append-only + F1 schema (option B) + CallerLookup adapter | (este PR) |
 | T5 | S3 | register_client usecase + clients repo + rate limiter + seam F2 | (este PR) |
 | T6 | S1,S2,S3 | MCP Streamable HTTP (SDK v1.7.0) + X-Caller-Id middleware + role-gated registry + composition wiring | (este PR) |
-| T7 | S4 | catalog_items + search_catalog (FTS5) | (pend) |
+| T7 | S4 | FTS5 v3 (v1.11 fields) + CatalogRepo + 3 usecases + 3 tools + 5 riders db + wiring | (este PR) |
 | T8 | S5 | Tickets tipo fijo + ticket_events auditados + re-engagement + transición por staff | (pend) |
 | T9 | S6,S7 | Skill template (doctrina resolutiva) + doc de pairing (WA verificado + verificación e-mail) | (pend) |
 | T10 | S8 | Tests de volumen (10k sintéticos) + demo reproducible + cierre F1 (DoD) | (pend) |
@@ -159,4 +159,24 @@ Quotes are VERBATIM from docs/PRD.md v1.10 — the RF text is the spec; never pa
   Fixes orquestador: misspell += conversacional, argumentos (5ª y 6ª palabras).
   ORÁCULO RESUELTO PREVIO por el owner: mensajes distintivos + trade-off documentado
   (X-Caller-Id inyectado por gateway confiable). SLICE: worker+mío en un commit
-  (unidad transport+wiring inseparable). Issue #21.
+  (unidad transport+wiring inseparable). Issue #21. MERGED 5459aa5 (PR #22,
+  review-f90b8b8884381ad5 APPROVED/burned — 3 advisories; incidente de admisión
+  reliability resuelto canónicamente: payload ambiguo preservado → STATUS → mismo
+  binding → nuevo payload admitido).
+- L11 (2026-11-26, T7): DELEGADO (5ª) a gentle-ai-worker: catálogo completo —
+  FTS5 migration v3 external-content (índice sobre name+description+use_cases+
+  limitations — v1.11: EL MATCH NACE DEL PROBLEMA DESCRITO; tokenize unicode61
+  remove_diacritics 2; 3 triggers de sync), CatalogRepo (CRUD+search prepared,
+  ftsExpression quoting contra inyección de gramática FTS5, browse para query
+  vacío, money INTEGER), Search/Create/Update usecases con double RBAC (re-assert
+  in-usecase), 3 MCP tools (search_catalog todos los roles resueltos;
+  create/update owner+admin invisibles+ininvocables para el resto), + LOS 5 RIDERS
+  db del review T4 RESUELTOS ESTRUCTURALMENTE: R2-003 test movido a open_test,
+  R2-004 seeds ahora placeholders por construcción con validateSeeds arity guard,
+  R3-001 buildDSN con tabla de rechazos (NUL/?/#, params _-prefixed, url.Values
+  Encode), R3-003 appliedVersions COUNT/MAX con aritmética de prefijo pineada,
+  R3-004 rollback honesto (cierra handle, borra SOLO lo que creó, respeta
+  pre-existing). WIRING INLINE MÍO: buildMCPHandler += CatalogRepo + 3 usecases
+  + Catalog deps (sin wiring el binario no exponía las tools). Pipeline verde
+  (7 paquetes -race, lint 0 issues tras problemas+columnas — 7ª y 8ª palabras).
+  ~3.8k líneas. Issue #23.
