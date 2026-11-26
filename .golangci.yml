@@ -1,0 +1,17 @@
+# golangci-lint baseline — v2 config format (golangci-lint 2.14 line).
+# The AGENTS.md pipeline runs this before every commit; keep the standard set
+# plus the explicit enablements the pre-commit checklist names.
+version: "2"
+
+linters:
+  default: standard
+  enable:
+    - errcheck
+    - govet
+    - staticcheck
+    - unused
+    - ineffassign
+    - misspell
+
+run:
+  timeout: 5m
