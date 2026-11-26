@@ -65,8 +65,10 @@ func migrate(ctx context.Context, handle *sql.DB) error {
 }
 
 // validateMigrations proves the compiled-in sequence is contiguous and starts
-// at 1. A gap here is a programming error, not an operator error, and is
-// reported as a startup refusal so it can never reach a database.
+// at 1, and that every step carries at least one statement with its arguments
+// matching its placeholders. A failure here is a programming error, not an
+// operator error, and is reported as a startup refusal so it can never reach a
+// database.
 func validateMigrations(steps []migration) error {
 	if len(steps) == 0 {
 		return errors.New("migraciones: la secuencia está vacía")
@@ -76,78 +78,84 @@ func validateMigrations(steps []migration) error {
 		if step.version != want {
 			return fmt.Errorf("migraciones: la versión %d está fuera de secuencia (se esperaba %d sin huecos)", step.version, want)
 		}
-		if len(step.statements) == 0 {
+		if len(step.statements) == 0 && len(step.seeds) == 0 {
 			return fmt.Errorf("migraciones: la versión %d no tiene sentencias DDL", step.version)
+		}
+		if err := validateSeeds(step); err != nil {
+			return err
 		}
 	}
 	return nil
 }
 
-// appliedVersions returns the recorded versions in ascending order.
-func appliedVersions(ctx context.Context, handle *sql.DB) ([]int, error) {
-	rows, err := handle.QueryContext(ctx, `SELECT version FROM schema_migrations ORDER BY version`)
-	if err != nil {
-		return nil, fmt.Errorf("leer schema_migrations: %w", err)
-	}
-	defer func() { _ = rows.Close() }()
-
-	var versions []int
-	for rows.Next() {
-		var version int
-		if err := rows.Scan(&version); err != nil {
-			return nil, fmt.Errorf("leer schema_migrations: %w", err)
+// validateSeeds proves every data statement of a step binds exactly one value
+// per placeholder. It is the structural half of R2-004: a seed that forgot an
+// argument, or that pasted a value into its SQL, is refused at startup instead
+// of failing on the operator's database.
+func validateSeeds(step migration) error {
+	for _, seed := range step.seeds {
+		if strings.TrimSpace(seed.sql) == "" {
+			return fmt.Errorf("migraciones: la versión %d tiene una sentencia de datos vacía", step.version)
 		}
-		versions = append(versions, version)
+		placeholders := strings.Count(seed.sql, "?")
+		if placeholders != len(seed.args) {
+			return fmt.Errorf("migraciones: la versión %d tiene una sentencia de datos con %d placeholders y %d valores", step.version, placeholders, len(seed.args))
+		}
 	}
-	if err := rows.Err(); err != nil {
-		return nil, fmt.Errorf("leer schema_migrations: %w", err)
+	return nil
+}
+
+// appliedState is the bookkeeping summary of a database: how many versions it
+// records and the highest of them (R3-003 — one aggregate query instead of
+// loading every row).
+//
+// Two integers answer everything the runner asks. Versions are the primary key
+// of schema_migrations, so a consistent database that records version N holds
+// exactly N rows: count == highest means the applied set is precisely 1..N, and
+// any other relation means a hole or a hand-edited file.
+type appliedState struct {
+	count   int
+	highest int
+}
+
+// appliedVersions reads the bookkeeping summary in a single query.
+func appliedVersions(ctx context.Context, handle *sql.DB) (appliedState, error) {
+	var state appliedState
+	if err := handle.QueryRowContext(ctx,
+		`SELECT COUNT(*), COALESCE(MAX(version), 0) FROM schema_migrations`,
+	).Scan(&state.count, &state.highest); err != nil {
+		return appliedState{}, fmt.Errorf("leer schema_migrations: %w", err)
 	}
-	return versions, nil
+	return state, nil
 }
 
 // pendingMigrations returns the steps that still have to run, refusing a
 // schema that is unknown or has a hole below the highest applied version.
-// (A duplicated version cannot occur: the bookkeeping table's primary key is
-// the version itself.)
-func pendingMigrations(applied []int, steps []migration) ([]migration, error) {
-	known := make(map[int]struct{}, len(steps))
-	for _, step := range steps {
-		known[step.version] = struct{}{}
+//
+// Precondition: the compiled-in sequence is exactly 1..N (validateMigrations
+// runs before this), so the highest applied version is also the slice index of
+// the first pending step.
+func pendingMigrations(applied appliedState, steps []migration) ([]migration, error) {
+	known := len(steps)
+
+	// A version this binary does not know: the schema is ahead of the binary.
+	if applied.highest > known {
+		return nil, fmt.Errorf("esquema desconocido: la base registra la migración %d, que este binario no conoce; se niega a arrancar (fail-closed)", applied.highest)
 	}
 
-	seen := make(map[int]struct{}, len(applied))
-	for _, version := range applied {
-		if _, ok := known[version]; !ok {
-			return nil, fmt.Errorf("esquema desconocido: la base registra la migración %d, que este binario no conoce; se niega a arrancar (fail-closed)", version)
-		}
-		seen[version] = struct{}{}
+	// The applied set must be the prefix 1..highest. A count below the highest
+	// version means a step was skipped (or the table was hand-edited) and every
+	// later step is suspect; a count above it is impossible for distinct
+	// positive versions, so the same refusal covers a corrupted file.
+	if applied.count != applied.highest {
+		return nil, fmt.Errorf("esquema inválido: la base registra %d migraciones con la versión máxima %d (la secuencia debe ser 1..N sin huecos)", applied.count, applied.highest)
 	}
 
-	// The applied set must be the prefix 1..max: a hole below the highest
-	// version means a step was skipped and every later step is suspect.
-	highest := 0
-	for _, version := range applied {
-		if version > highest {
-			highest = version
-		}
-	}
-	for version := 1; version <= highest; version++ {
-		if _, ok := seen[version]; !ok {
-			return nil, fmt.Errorf("esquema inválido: falta la migración %d con la %d ya aplicada", version, highest)
-		}
-	}
-
-	var pending []migration
-	for _, step := range steps {
-		if _, ok := seen[step.version]; !ok {
-			pending = append(pending, step)
-		}
-	}
-	return pending, nil
+	return steps[applied.highest:], nil
 }
 
-// applyMigration runs one step atomically: its DDL and the schema_migrations
-// row commit together or not at all.
+// applyMigration runs one step atomically: its DDL, its data statements and the
+// schema_migrations row commit together or not at all.
 func applyMigration(ctx context.Context, handle *sql.DB, step migration) error {
 	tx, err := handle.BeginTx(ctx, nil)
 	if err != nil {
@@ -158,6 +166,12 @@ func applyMigration(ctx context.Context, handle *sql.DB, step migration) error {
 	for _, statement := range step.statements {
 		if _, err := tx.ExecContext(ctx, statement); err != nil {
 			return fmt.Errorf("migración %d: %s: %w", step.version, statementName(statement), err)
+		}
+	}
+
+	for _, seed := range step.seeds {
+		if _, err := tx.ExecContext(ctx, seed.sql, seed.args...); err != nil {
+			return fmt.Errorf("migración %d: %s: %w", step.version, statementName(seed.sql), err)
 		}
 	}
 

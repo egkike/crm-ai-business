@@ -122,9 +122,33 @@ func buildMCPHandler() (http.Handler, error) {
 		return nil, err
 	}
 
+	// Catalog (T7): repo + usecases; the handler refuses partial catalog
+	// wiring, so all three must be present or none.
+	catalogRepo, err := repository.NewCatalogRepo(handle)
+	if err != nil {
+		return nil, err
+	}
+	searchCatalog, err := usecase.NewSearchCatalog(catalogRepo)
+	if err != nil {
+		return nil, err
+	}
+	createCatalogItem, err := usecase.NewCreateCatalogItem(catalogRepo)
+	if err != nil {
+		return nil, err
+	}
+	updateCatalogItem, err := usecase.NewUpdateCatalogItem(catalogRepo)
+	if err != nil {
+		return nil, err
+	}
+
 	return mcp.NewHandler(mcp.Dependencies{
 		CallerResolver: resolver,
 		RegisterClient: registerClient,
+		Catalog: &mcp.CatalogDependencies{
+			Search: searchCatalog,
+			Create: createCatalogItem,
+			Update: updateCatalogItem,
+		},
 	})
 }
 
