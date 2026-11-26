@@ -13,8 +13,11 @@
 //     F2 (workflow engine) and F3 (bookings). Until then a ticket carries a
 //     plain `state` text column with the seeded initial state 'nuevo'.
 //   - bookings, alerts, sessions — F3, F2 and F4 respectively.
-//   - FTS5 index over catalog_items — F1/T7 (search_catalog). The base table
-//     lands here so the search migration can be purely additive.
+//
+// The FTS5 search index over catalog_items is NOT deferred any more: migration
+// 3 (T7, RF4) creates it as an external-content virtual table kept in sync by
+// triggers, so search_catalog matches the problem the client describes and not
+// just the item's name.
 //
 // Per-column deferrals are documented next to the DDL that owns the table, so
 // the next migration author knows exactly where to resume.

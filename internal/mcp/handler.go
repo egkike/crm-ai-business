@@ -54,6 +54,11 @@ type Dependencies struct {
 	// RegisterClient is the F1 registration use case behind the register_client
 	// tool.
 	RegisterClient RegisterClient
+
+	// Catalog carries the three RF4 use cases (search, create, update). Nil
+	// means "this handler has no catalog tools"; a partially filled Catalog is
+	// a construction error, never a degraded server.
+	Catalog *CatalogDependencies
 }
 
 // NewHandler builds the /mcp handler with the F1 tool set.
@@ -67,12 +72,16 @@ func NewHandler(deps Dependencies) (http.Handler, error) {
 }
 
 // NewHandlerWithTools builds the /mcp handler with the F1 tool set plus extra
-// tools (the extension point later phases — catalog, tickets — use to declare
-// their tools and their Access).
+// tools (the extension point later phases — tickets — use to declare their tools
+// and their Access).
 //
-// Tools are validated as a whole: a nil definition, a nil handler or a duplicate
-// name refuses construction, so a wiring mistake cannot silently shadow a tool.
-// The F1 core tool (register_client) is always present and cannot be replaced.
+// The default set is register_client plus, when Dependencies.Catalog is wired,
+// the three RF4 catalog tools; the composition root decides whether the catalog
+// exists in this handler, and the registry decides who may see each tool. Tools
+// are validated as a whole: a nil definition, a nil handler, a partially wired
+// catalog or a duplicate name refuses construction, so a wiring mistake cannot
+// silently shadow a tool. The F1 core tool (register_client) is always present
+// and cannot be replaced.
 func NewHandlerWithTools(deps Dependencies, extra ...Tool) (http.Handler, error) {
 	if deps.CallerResolver == nil {
 		return nil, errors.New("transporte MCP: se requiere un CallerResolver")
@@ -81,8 +90,14 @@ func NewHandlerWithTools(deps Dependencies, extra ...Tool) (http.Handler, error)
 		return nil, errors.New("transporte MCP: se requiere el caso de uso RegisterClient")
 	}
 
-	tools := make([]Tool, 0, len(extra)+1)
+	catalogTools, err := newCatalogTools(deps.Catalog)
+	if err != nil {
+		return nil, err
+	}
+
+	tools := make([]Tool, 0, len(extra)+1+len(catalogTools))
 	tools = append(tools, registerClientTool(deps.RegisterClient))
+	tools = append(tools, catalogTools...)
 
 	for _, tool := range extra {
 		// The anonymous principal exists for ONE reason: the RF3 registration

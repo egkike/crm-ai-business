@@ -27,6 +27,26 @@ const (
 	CodeIdentifierTaken ErrorCode = "identifier_taken"
 )
 
+// The semantic failures of the RF4 catalog.
+const (
+	// CodeRoleNotAllowed: the caller's role may not perform this operation. It
+	// is the in-use-case re-assertion of AGENTS.md's double RBAC: the transport
+	// already filtered the tool, and this is the second, independent barrier that
+	// a use case called from another adapter (the panel of F4) still enforces.
+	CodeRoleNotAllowed ErrorCode = "role_not_allowed"
+
+	// CodeInvalidCatalogKind: the kind is outside the RF4 vocabulary
+	// (producto|servicio).
+	CodeInvalidCatalogKind ErrorCode = "invalid_catalog_kind"
+
+	// CodeInvalidCatalogItem: a catalog field violates its rule (empty name,
+	// negative price, duration on a product, oversized text).
+	CodeInvalidCatalogItem ErrorCode = "invalid_catalog_item"
+
+	// CodeCatalogItemNotFound: the update names an id no row carries.
+	CodeCatalogItemNotFound ErrorCode = "catalog_item_not_found"
+)
+
 // SemanticError is the application layer's user-facing failure.
 //
 // Its Message is the only text that may cross the sanitization boundary
@@ -48,6 +68,13 @@ func (e *SemanticError) Code() ErrorCode { return e.code }
 
 // Message returns the Spanish, user-facing text of the failure.
 func (e *SemanticError) Message() string { return e.message }
+
+// newSemanticError builds a semantic failure where the phrasing depends on the
+// offending input (which field, which value). The code carries the
+// machine-readable class, so a transport never parses the prose.
+func newSemanticError(code ErrorCode, message string) error {
+	return &SemanticError{code: code, message: message}
+}
 
 // The sentinel semantic failures of the registration seam. They are returned
 // unwrapped so callers can match with errors.Is and render Message verbatim.

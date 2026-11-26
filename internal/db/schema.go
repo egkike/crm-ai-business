@@ -25,12 +25,35 @@ const (
 	TicketStateInitial = "nuevo"
 )
 
-// migration is one numbered, append-only DDL step. statements run in order
-// inside a single transaction together with the schema_migrations row that
-// records the step, so a database is never left at a half-applied version.
+// migration is one numbered, append-only step. Its DDL (statements) and its
+// data writes (seeds) run in order inside a single transaction together with
+// the schema_migrations row that records the step, so a database is never left
+// at a half-applied version.
+//
+// The two lists exist so that product data can NEVER be interpolated into SQL
+// text: a DDL statement is static (constants composed at compile time), while
+// a seed carries its values as bound arguments. Rider R2-004 (review
+// 31ae9e99067acc33) is the reason this split is structural instead of a
+// convention — the F1 seed used to concatenate its identifiers straight into
+// the INSERT, and the next migration author would have copied the pattern with
+// genuinely dynamic data.
 type migration struct {
-	version    int
+	version int
+
+	// statements are the static DDL statements of the step, run first.
 	statements []string
+
+	// seeds are the data statements of the step, run after the DDL: a seed may
+	// reference a table created in the same step.
+	seeds []seedStatement
+}
+
+// seedStatement is one data statement of a migration, with its values bound by
+// placeholder. The values live in args, never in sql: there is no seam through
+// which a future author could concatenate a dynamic value into the text.
+type seedStatement struct {
+	sql  string
+	args []any
 }
 
 // migrations is the ordered sequence of schema steps this binary knows. The
@@ -63,8 +86,25 @@ var migrations = []migration{
 		// the DDL step so a future phase can add its seed templates without
 		// touching an applied migration.
 		version: 2,
+		seeds: []seedStatement{
+			{sql: seedTicketTypeConsulta, args: []any{TicketTypeConsultaID, TicketTypeConsultaName}},
+		},
+	},
+	{
+		// RF4 catalog search (T7): the FTS5 index over every field Hermes needs
+		// to answer "¿tenés X?" from a description of the problem rather than
+		// from the item's name alone, plus the triggers that keep it in sync
+		// with catalog_items.
+		//
+		// Additive only: the base table landed in step 1, the search surface is
+		// an index on top of it, and catalog data is never seeded (the Owner
+		// creates it through the RF4 tools).
+		version: 3,
 		statements: []string{
-			seedTicketTypeConsulta,
+			ddlCatalogItemsFTS,
+			ddlCatalogItemsFTSInsert,
+			ddlCatalogItemsFTSUpdate,
+			ddlCatalogItemsFTSDelete,
 		},
 	},
 }
@@ -203,8 +243,9 @@ CREATE TABLE business_profile (
 // Deferred columns, and why:
 //   - currency — v1 is single-currency by product decision; a currency column
 //     now would be a per-row value nobody validates.
-//   - FTS5 index over name/description/use_cases — T7 (search_catalog); it is
-//     an additive migration on top of this table.
+//
+// The FTS5 index over name/description/use_cases/limitations is migration 3
+// (T7, search_catalog); it is an additive step on top of this table.
 const ddlCatalogItems = `
 CREATE TABLE catalog_items (
     id           TEXT PRIMARY KEY NOT NULL CHECK (length(id) = 36),
@@ -221,6 +262,73 @@ CREATE TABLE catalog_items (
     updated_at   TEXT NOT NULL DEFAULT (` + timestampDefault + `),
     CHECK (kind = 'servicio' OR duration_min IS NULL)
 )`
+
+// ddlCatalogItemsFTS is the RF4 search index (T7) over the four fields that
+// carry the item's meaning: name, description, use_cases and limitations.
+//
+// Shape choice: an EXTERNAL CONTENT FTS5 table (content='catalog_items'), not a
+// standalone copy of the text. Rationale, in the order that decided it:
+//
+//   - One source of truth. catalog_items stays the only place the text lives,
+//     so a panel edit and a search result can never diverge, and the index costs
+//     only the inverted lists (no duplicate row per item).
+//   - The rowid of catalog_items is stable: it is a TEXT-primary-key table, so
+//     the implicit rowid survives name/price edits, which is exactly the handle
+//     the 'delete' commands of the triggers need.
+//   - Ranking with bm25() works identically on an external content table.
+//
+// tokenize: unicode61 with remove_diacritics 2. Hermes' callers write Spanish
+// with or without accents ("corte" vs "corté"), and folding them to one token
+// is the difference between a hit and a false negative; unicode61 also handles
+// the words as words instead of as bytes (no Porter stemmer, because product
+// names are nouns the stemming rules would mangle).
+//
+// The triggers below are the whole synchronization contract. They are AFTER
+// triggers on the base table, so every writer — the RF4 tools today, the panel
+// tomorrow — keeps the index correct without knowing the index exists. The
+// update trigger fires only when indexed text changed: an is_active or price
+// edit must not pay for a reindex of text that did not move.
+const ddlCatalogItemsFTS = `
+CREATE VIRTUAL TABLE catalog_items_fts USING fts5(
+    name,
+    description,
+    use_cases,
+    limitations,
+    content='catalog_items',
+    content_rowid='rowid',
+    tokenize='unicode61 remove_diacritics 2'
+)`
+
+// ddlCatalogItemsFTSInsert indexes a new item. NULL use_cases/limitations are
+// allowed by the base table and index as empty text, which is what they mean:
+// the item says nothing about them.
+const ddlCatalogItemsFTSInsert = `
+CREATE TRIGGER catalog_items_fts_ai AFTER INSERT ON catalog_items BEGIN
+    INSERT INTO catalog_items_fts (rowid, name, description, use_cases, limitations)
+    VALUES (new.rowid, new.name, new.description, new.use_cases, new.limitations);
+END`
+
+// ddlCatalogItemsFTSUpdate replaces the indexed text of a row. For an external
+// content table a re-index is a 'delete' command carrying the OLD values
+// followed by the new row: FTS5 needs the old text to remove its tokens from the
+// inverted lists, which is why the old values travel in the command instead of
+// being read back from the (already overwritten) content table.
+const ddlCatalogItemsFTSUpdate = `
+CREATE TRIGGER catalog_items_fts_au AFTER UPDATE OF name, description, use_cases, limitations ON catalog_items BEGIN
+    INSERT INTO catalog_items_fts (catalog_items_fts, rowid, name, description, use_cases, limitations)
+    VALUES ('delete', old.rowid, old.name, old.description, old.use_cases, old.limitations);
+    INSERT INTO catalog_items_fts (rowid, name, description, use_cases, limitations)
+    VALUES (new.rowid, new.name, new.description, new.use_cases, new.limitations);
+END`
+
+// ddlCatalogItemsFTSDelete removes a row's tokens. Same 'delete' command as the
+// update trigger: the values of the removed row are the only way FTS5 can drop
+// its postings from an external content index.
+const ddlCatalogItemsFTSDelete = `
+CREATE TRIGGER catalog_items_fts_ad AFTER DELETE ON catalog_items BEGIN
+    INSERT INTO catalog_items_fts (catalog_items_fts, rowid, name, description, use_cases, limitations)
+    VALUES ('delete', old.rowid, old.name, old.description, old.use_cases, old.limitations);
+END`
 
 // ddlTicketTypes is the ticket-type catalogue. F1 has exactly one seeded type
 // (the seed migration below); F2 turns this into the configurable workflow
@@ -316,5 +424,8 @@ CREATE INDEX ticket_events_ticket_idx ON ticket_events (ticket_id, id)`
 // account is deliberately NOT seeded here: internal accounts are created by
 // the Owner through `setup --create-owner` (F4), and a seeded account would be
 // a shipped credential.
+//
+// Values are bound, not interpolated (R2-004): the step carries them in
+// migration.seeds, so this constant is a plain placeholder statement.
 const seedTicketTypeConsulta = `
-INSERT INTO ticket_types (id, name) VALUES ('` + TicketTypeConsultaID + `', '` + TicketTypeConsultaName + `')`
+INSERT INTO ticket_types (id, name) VALUES (?, ?)`

@@ -4,6 +4,8 @@ import (
 	"context"
 	"database/sql"
 	"fmt"
+	"net/url"
+	"os"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -35,6 +37,142 @@ func queryValue(t *testing.T, handle *sql.DB, query string, args ...any) string 
 		t.Fatalf("consulta %q: %v", query, err)
 	}
 	return value
+}
+
+// TestOpenRefusesInvalidPath proves Open fails closed before touching the
+// filesystem: a rejected path config never creates a file or a directory.
+//
+// (Rider R2-003 of review 31ae9e99067acc33 moved this test here from
+// migrate_test.go: it pins Open's own contract, not the migration runner's, and
+// a reader looking for the fail-closed path rule should find it in the file that
+// owns path resolution and opening.)
+func TestOpenRefusesInvalidPath(t *testing.T) {
+	base := t.TempDir()
+	directory := filepath.Join(base, "archivo-que-es-directorio")
+	if err := os.Mkdir(directory, 0o700); err != nil {
+		t.Fatalf("preparar el directorio: %v", err)
+	}
+
+	for _, invalid := range []string{"crm.db", "   ", "/tmp/crm.db?cache=shared", directory} {
+		t.Run(fmt.Sprintf("%q", invalid), func(t *testing.T) {
+			if handle, err := Open(context.Background(), invalid); err == nil {
+				_ = handle.Close()
+				t.Fatal("Open() con una ruta inválida debía fallar (fail-closed)")
+			}
+		})
+	}
+
+	// Nothing was created along the way: the rejected configuration did not get
+	// as far as the filesystem.
+	entries, err := os.ReadDir(base)
+	if err != nil {
+		t.Fatalf("leer el directorio de la prueba: %v", err)
+	}
+	if len(entries) != 1 || entries[0].Name() != filepath.Base(directory) {
+		t.Fatalf("el directorio de la prueba cambió: %v", entries)
+	}
+}
+
+// TestOpenFailureLeavesNoDirectory pins rider R3-004: a startup that fails after
+// creating the data directory removes what it created, so a refused open never
+// leaves an empty database behind for the operator to mistake for state.
+func TestOpenFailureLeavesNoDirectory(t *testing.T) {
+	base := t.TempDir()
+	dir := filepath.Join(base, appDirName)
+	path := filepath.Join(dir, dbFileName)
+
+	// A cancelled context fails at the first statement the driver runs, which is
+	// the natural way to reach the failure path after the directory exists.
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+
+	handle, err := Open(ctx, path)
+	if err == nil {
+		_ = handle.Close()
+		t.Fatal("Open() con un contexto cancelado debía fallar")
+	}
+
+	if _, statErr := os.Stat(dir); !os.IsNotExist(statErr) {
+		t.Fatalf("el directorio %q sobrevivió a un Open fallido (stat: %v)", dir, statErr)
+	}
+	if _, statErr := os.Stat(path); !os.IsNotExist(statErr) {
+		t.Fatalf("el archivo %q sobrevivió a un Open fallido (stat: %v)", path, statErr)
+	}
+}
+
+// TestOpenFailureKeepsPreexistingState pins the other half of R3-004: cleanup
+// removes only what this call created. A database that already existed and
+// failed to open is the operator's file, and deleting it would turn a startup
+// refusal into data loss.
+func TestOpenFailureKeepsPreexistingState(t *testing.T) {
+	path := filepath.Join(t.TempDir(), dbFileName)
+	if err := os.WriteFile(path, []byte("no soy una base sqlite"), 0o600); err != nil {
+		t.Fatalf("preparar el archivo inválido: %v", err)
+	}
+
+	if handle, err := Open(context.Background(), path); err == nil {
+		_ = handle.Close()
+		t.Fatal("Open() debía fallar con un archivo que no es una base")
+	}
+
+	if _, err := os.Stat(path); err != nil {
+		t.Fatalf("el archivo preexistente debe sobrevivir: %v", err)
+	}
+}
+
+// TestBuildDSN pins rider R3-001: the connection string is assembled from a
+// validated path and encoded parameters, and every path that could change the
+// DSN's meaning is refused instead of being pasted in.
+func TestBuildDSN(t *testing.T) {
+	t.Run("ruta simple y parámetros del contrato", func(t *testing.T) {
+		dsn, err := buildDSN("/datos/crm.db", connectionParams())
+		if err != nil {
+			t.Fatalf("buildDSN() error inesperado: %v", err)
+		}
+		if !strings.HasPrefix(dsn, "/datos/crm.db?") {
+			t.Fatalf("dsn = %q, se esperaba la ruta seguida de la query", dsn)
+		}
+		for _, want := range []string{"_busy_timeout=5000", "_journal_mode=WAL", "_foreign_keys=ON"} {
+			if !strings.Contains(dsn, want) {
+				t.Fatalf("dsn = %q, se esperaba %q", dsn, want)
+			}
+		}
+	})
+
+	t.Run("sin parámetros la ruta va sola", func(t *testing.T) {
+		dsn, err := buildDSN("/datos/crm.db", url.Values{})
+		if err != nil {
+			t.Fatalf("buildDSN() error inesperado: %v", err)
+		}
+		if dsn != "/datos/crm.db" {
+			t.Fatalf("dsn = %q, se esperaba solo la ruta", dsn)
+		}
+	})
+
+	t.Run("rutas que cambian el significado del DSN son rechazadas", func(t *testing.T) {
+		for _, invalid := range []string{"", "/datos/crm.db?modo=otro", "/datos/crm#1.db", "/datos/crm\x00.db"} {
+			if dsn, err := buildDSN(invalid, connectionParams()); err == nil {
+				t.Fatalf("buildDSN(%q) = %q, se esperaba fail-closed", invalid, dsn)
+			}
+		}
+	})
+
+	t.Run("parámetros fuera del contrato son rechazados", func(t *testing.T) {
+		cases := map[string]url.Values{
+			"sin prefijo":             {"journal_mode": {"WAL"}},
+			"con separador en nombre": {"_mode&x": {"WAL"}},
+			"con separador en valor":  {"_journal_mode": {"WAL&_foreign_keys=OFF"}},
+			"valor vacío":             {"_journal_mode": {""}},
+			"sin valor":               {"_journal_mode": {}},
+		}
+		for name, params := range cases {
+			t.Run(name, func(t *testing.T) {
+				if dsn, err := buildDSN("/datos/crm.db", params); err == nil {
+					t.Fatalf("buildDSN() = %q, se esperaba fail-closed", dsn)
+				}
+			})
+		}
+	})
 }
 
 // TestOpenAppliesConnectionPragmas pins the AGENTS.md connection contract:

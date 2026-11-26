@@ -50,3 +50,8 @@
 | R3-001 (review-923a035dd8dd3224) | same unbounded display_name (duplicate of the risk finding) | **Pending** — same fix as R1-displayname-unbounded |
 | R3-002 (review-923a035dd8dd3224) | limiter budget burned by attempts that fail after admission | **No action** — fail-closed by design; retry-UX note for the F2 scheduler backlog |
 | misspell/conversacional+argumentos (T6 worker report) | two more Spanish words flagged | **Fixed** — T6: added to misspell ignore-rules (fifth and sixth words) |
+| R1-backlog-displayname-pending (review-f90b8b8884381ad5) | backlog still listed R1-displayname-unbounded as Pending though internal/mcp already enforces the 120-rune cap | **Fixed** — entry closed: the T6 worker implemented MaxDisplayNameLen=120 runes in register_client |
+| R1-transport-identity-header-trust (review-f90b8b8884381ad5) | identity taken solely from X-Caller-Id with no verification | **No action** — documented design: mitigated by the loopback invariant pinned at the composition root |
+| R3-dbhandle-leak-composition (review-f90b8b8884381ad5) | buildMCPHandler leaves the SQLite handle unclosed on intermediate errors | **Pending** — fold into the next cmd/server touch (harmless today: startup failure exits the process) |
+| R1-displayname-unbounded (review-923a035dd8dd3224) | register_client accepts unbounded DisplayName | **Fixed** — via T6 (120-rune cap; closed by the T6 review's own finding) |
+| misspell/problemas+columnas (T7 worker report) | two more Spanish words | **Fixed** — T7: added to misspell ignore-rules (seventh and eighth words) |
