@@ -96,11 +96,22 @@ const (
 // validTransitionRole reports whether the role belongs to the vocabulary.
 // A "client" or empty role is not a transition role.
 func (r TransitionRole) valid() bool {
+	return r.rank() > 0
+}
+
+// rank is the ascending authority of a role: staff < admin < owner. A value
+// outside the vocabulary ("client", empty, a future role this binary does not
+// know) ranks 0 and therefore never authorizes a transition.
+func (r TransitionRole) rank() int {
 	switch r {
-	case TransitionRoleStaff, TransitionRoleAdmin, TransitionRoleOwner:
-		return true
+	case TransitionRoleStaff:
+		return 1
+	case TransitionRoleAdmin:
+		return 2
+	case TransitionRoleOwner:
+		return 3
 	default:
-		return false
+		return 0
 	}
 }
 
@@ -316,6 +327,98 @@ func (c WorkflowConfig) validateTransitions(stateIndex map[string]bool) error {
 		}
 	}
 	return nil
+}
+
+// --- The engine rules ------------------------------------------------------
+//
+// RF5 says "estados/deadlines computan desde la config del tipo" and RF6 says
+// the Owner declares the transitions and the role each one requires. These pure
+// lookups are how the engine executes that declaration: the ticket use cases
+// stay a thin orchestration layer (load the config, ask these questions, write
+// the guarded change), and the answers come from one place instead of being
+// re-derived per call site.
+//
+// None of them validates the config: a config is validated once, when it is
+// saved (Validate). These methods answer against whatever they are given, and a
+// malformed config yields the fail-closed answer (see IsTerminal).
+
+// State returns the declared state named name, or found=false when the config
+// does not declare it. The state names are the vocabulary of the type, so the
+// answer to "does this state exist for this ticket?" is exactly this lookup.
+func (c WorkflowConfig) State(name string) (StateConfig, bool) {
+	for _, state := range c.States {
+		if state.Name == name {
+			return state, true
+		}
+	}
+	return StateConfig{}, false
+}
+
+// Transition returns the transition that declares from → to, or found=false
+// when the pair is not declared.
+//
+// A pair of declared states is NOT a transition on its own: the graph is what
+// the Owner declared, never what the state names suggest (two states of one
+// pipeline can sit adjacent in the declaration order and still be unreachable
+// from each other).
+func (c WorkflowConfig) Transition(from, to string) (TransitionConfig, bool) {
+	for _, transition := range c.Transitions {
+		if transition.From == from && transition.To == to {
+			return transition, true
+		}
+	}
+	return TransitionConfig{}, false
+}
+
+// IsTerminal reports whether the state is a terminal state of the pipeline: a
+// state with no outgoing transition, which is where a conversation ends
+// ('cerrado'/'perdido' of 'venta', 'resuelto' of 'consulta'). The engine stamps
+// closed_at on entering one and refuses activity on it (RF5: a closed ticket
+// accepts no further notes).
+//
+// A state the config does not declare — or that has no outgoing transition yet
+// because the config was never saved — is TERMINAL. That is the fail-closed
+// direction: a state nobody declared cannot legally receive activity, and
+// treating it as open would let a note land on a conversation no configured
+// transition can ever move.
+func (c WorkflowConfig) IsTerminal(state string) bool {
+	for _, transition := range c.Transitions {
+		if transition.From == state {
+			return false
+		}
+	}
+	return true
+}
+
+// TerminalStates returns the terminal states in declaration order. It is the
+// set form of IsTerminal, for readers that answer "which states end a
+// conversation?" once instead of per ticket (the F4 panel's state menu, the
+// lists of the admin tools).
+func (c WorkflowConfig) TerminalStates() []string {
+	terminal := make([]string, 0, len(c.States))
+	for _, state := range c.States {
+		if c.IsTerminal(state.Name) {
+			terminal = append(terminal, state.Name)
+		}
+	}
+	return terminal
+}
+
+// CanBeExecutedBy reports whether a caller holding role may execute this
+// transition.
+//
+// MinRole is the LEAST role authorized ("rol autorizado por transición"), and
+// internal roles ascend staff < admin < owner, so a role at or above the
+// declared one passes and anything below it does not. That is what makes the
+// RF6 criterion executable: a transition that requires staff+ is refused to a
+// client, not because clients are special-cased here but because "client" is
+// not in the transition vocabulary at all (rank 0).
+func (t TransitionConfig) CanBeExecutedBy(role TransitionRole) bool {
+	required := t.MinRole.rank()
+	if required == 0 {
+		return false
+	}
+	return role.rank() >= required
 }
 
 // VentaTemplate is the 'venta' seed pipeline of PRD §3.7: "'venta': nuevo →

@@ -6,22 +6,35 @@ import (
 	"errors"
 	"fmt"
 	"strings"
+	"time"
 	"unicode"
 	"unicode/utf8"
 
 	"github.com/egkike/crm-ai-business/internal/application/dto"
 	"github.com/egkike/crm-ai-business/internal/auth"
+	"github.com/egkike/crm-ai-business/internal/domain"
 )
 
-// This file is the application layer of RF5 (tickets con historial auditable,
-// F1 con un tipo fijo): creation, the two list views, the note / re-engagement
-// path and the staff transition.
+// This file is the application layer of RF5 (tickets con historial auditable) as
+// F2 left it: the creation and the transition EXECUTE the workflow the business
+// configured for the ticket's type (RF5: "estados/deadlines computan desde la
+// config del tipo"; RF6: transitions, roles and round-robin are configuration),
+// and the two list views, the note and the re-engagement path derive "closed"
+// from that same configuration instead of from a fixed vocabulary.
+//
+// The engine is thin on purpose. The questions it asks are the domain's
+// (WorkflowConfig.State/Transition/IsTerminal, TransitionConfig.CanBeExecutedBy);
+// what lives here is the orchestration: load the config of the ticket's type,
+// map a resolved auth.Role onto the domain's transition vocabulary, compute the
+// deadline of the state being entered, ask the area rotation who is next, build
+// the audited event and hand the guarded write to the repository.
 //
 // Every use case re-asserts its own authorization (AGENTS.md boundary contract 1,
 // double RBAC): the MCP transport already filtered the tool by role, and the
 // re-assertion is the independent barrier that still holds when the same use case
 // is reached from another adapter (the internal panel of F4) or when the
-// transport's permission map is edited by mistake.
+// transport's permission map is edited by mistake. On top of the role gate, the
+// transition enforces the PER-TRANSITION minimum role the Owner configured (RF6).
 //
 // The AUDIT is the reason these carriers exist. RF5 requires that every
 // transition, note, re-engagement message and assignment change lands in
@@ -70,15 +83,31 @@ type TicketStore interface {
 	// and reads the ticket back, all in one transaction guarded by the ticket
 	// still being open.
 	//
-	// It reports found=false when the guard refused (the ticket is gone or is
-	// closed), in which case nothing was written. It is one operation instead of
-	// append + touch + read because a note that is audited while the ticket's
-	// activity stays put leaves the F2 inactivity clock stale, and a note that
-	// lands after a concurrent close reopens a closed conversation.
+	// It reports found=false when the guard refused (the ticket is gone or its
+	// state is terminal in the type's configuration), in which case nothing was
+	// written. It is one operation instead of append + touch + read because a
+	// note that is audited while the ticket's activity stays put leaves the F2
+	// inactivity clock stale, and a note that lands after a concurrent close
+	// reopens a closed conversation.
 	AddTicketNote(ctx context.Context, note dto.TicketNoteAppend) (dto.TicketRecord, bool, error)
 
 	// ListTicketEvents returns a ticket's history, oldest first.
 	ListTicketEvents(ctx context.Context, ticketID string) ([]dto.TicketEventRecord, error)
+}
+
+// AreaRotator is the round-robin queue of one area (RF6: "auto-asignación
+// round-robin del área").
+//
+// It is a port of its own instead of a method of the ticket store because the
+// question ("who is next in this area?") and the queue it reads (membership
+// plus past assignments) are not the ticket's: the engine asks once per
+// transition that declares the rule, and a fake with three members is all a use
+// case test needs to pin the wiring.
+type AreaRotator interface {
+	// NextAreaAssignee returns the account the next ticket of the area belongs
+	// to, or "" when the area has no members (the ticket then stays in the
+	// area's queue: an empty area is not an error).
+	NextAreaAssignee(ctx context.Context, areaID string) (string, error)
 }
 
 // ClientDirectory is the only thing the ticket use cases need from clients: "does
@@ -125,6 +154,25 @@ const (
 	// (a quantity, a price, an age) is left alone, and the masking does not turn
 	// every number in a message into noise.
 	minMaskedDigitRun = 7
+
+	// MaxTicketTypeNameLen bounds the ticket type a creation may name. It is the
+	// workflow name bound of the domain (domain.MaxWorkflowNameLen), which is
+	// also the DDL's `length(name) BETWEEN 1 AND 50` of ticket_types.
+	MaxTicketTypeNameLen = domain.MaxWorkflowNameLen
+
+	// defaultTicketTypeName is the type a creation that names none opens: the
+	// general consultation of the seed templates (dto.ConsultaTicketTypeName).
+	//
+	// It is a default for the INPUT (the agent does not always know the type),
+	// never a fallback for the CONFIG: a type that is not configured is rejected
+	// with a semantic error even when it is this one (fail-closed).
+	defaultTicketTypeName = dto.ConsultaTicketTypeName
+
+	// ticketTimestampLayout is the instant format of the ticket columns: ISO-8601
+	// UTC with millisecond precision, exactly what the schema's DEFAULT writes
+	// (`strftime('%Y-%m-%dT%H:%M:%fZ')`), so a value computed here sorts next to a
+	// value computed by SQLite.
+	ticketTimestampLayout = "2006-01-02T15:04:05.000Z"
 )
 
 // The semantic failures of this file that are shared by more than one use case.
@@ -193,26 +241,32 @@ func ticketActor(caller auth.Caller) string {
 // CreateTicket is the RF5 creation use case behind create_ticket.
 //
 // RF5: "todo contacto con motivo de negocio genera un ticket" — also a contact
-// that neither buys nor requests anything. The use case therefore asks for a
-// motive and nothing else: what the client needs is audited in the opening event,
-// and the state starts at the initial state of the (F1: single) ticket type.
+// that neither buys nor requests anything. The use case asks for a motive and the
+// type, and the type's CONFIGURATION decides the rest (RF5: "estados/deadlines
+// computan desde la config del tipo"): the state the ticket is born in, the area
+// it starts in, and the deadline that state declares.
 type CreateTicket struct {
-	tickets TicketStore
-	clients ClientDirectory
+	tickets   TicketStore
+	clients   ClientDirectory
+	workflows domain.WorkflowConfigStore
 }
 
 // NewCreateTicket wires the use case. A nil port is a fail-closed configuration
-// error: without persistence the use case could only fail, and without the client
+// error: without persistence the use case could only fail, without the client
 // directory the internal "on behalf of" path could not tell a real client from a
-// typo.
-func NewCreateTicket(tickets TicketStore, clients ClientDirectory) (*CreateTicket, error) {
+// typo, and without the workflow store the creation could not know the initial
+// state of the type it is opening.
+func NewCreateTicket(tickets TicketStore, clients ClientDirectory, workflows domain.WorkflowConfigStore) (*CreateTicket, error) {
 	if tickets == nil {
 		return nil, errors.New("tickets: se requiere un TicketStore para crear tickets")
 	}
 	if clients == nil {
 		return nil, errors.New("tickets: se requiere un ClientDirectory para crear tickets")
 	}
-	return &CreateTicket{tickets: tickets, clients: clients}, nil
+	if workflows == nil {
+		return nil, errors.New("tickets: se requiere un WorkflowConfigStore para crear tickets")
+	}
+	return &CreateTicket{tickets: tickets, clients: clients, workflows: workflows}, nil
 }
 
 // Execute opens a ticket for the caller, or for cmd.ClientID when the caller is
@@ -255,25 +309,44 @@ func (uc *CreateTicket) Execute(ctx context.Context, caller auth.Caller, cmd dto
 		}
 	}
 
+	// The type's configuration is the engine's first step: it answers where the
+	// ticket starts, in which area and with which deadline. A type nobody
+	// configured is a semantic rejection, never a fallback to a fixed pipeline.
+	config, err := loadWorkflow(ctx, uc.workflows, cmd.TicketType)
+	if err != nil {
+		return dto.CreateTicketResult{}, err
+	}
+
+	initial, found := config.State(config.InitialState)
+	if !found {
+		// loadWorkflow validated the config, which rejects an undeclared initial
+		// state; the branch keeps the invariant local instead of trusting it.
+		return dto.CreateTicketResult{}, newSemanticError(CodeUnusableWorkflow, fmt.Sprintf(
+			"el workflow del tipo '%s' no declara el estado inicial '%s'.",
+			config.TypeName, config.InitialState))
+	}
+
 	id, err := newUUID()
 	if err != nil {
 		return dto.CreateTicketResult{}, fmt.Errorf("tickets: crear el ticket: %w", err)
 	}
 
 	payload, err := encodeTicketEventPayload(ticketCreatedPayload{
-		TicketTypeID: dto.ConsultaTicketTypeID,
-		State:        dto.TicketStateInitial,
-		Motive:       maskPhoneRuns(motive),
+		TicketType: config.TypeName,
+		State:      dto.TicketState(config.InitialState),
+		Motive:     maskPhoneRuns(motive),
 	})
 	if err != nil {
 		return dto.CreateTicketResult{}, fmt.Errorf("tickets: crear el ticket: %w", err)
 	}
 
 	row := dto.NewTicket{
-		ID:           id,
-		TicketTypeID: dto.ConsultaTicketTypeID,
-		ClientID:     clientID,
-		State:        dto.TicketStateInitial,
+		ID:         id,
+		TicketType: config.TypeName,
+		ClientID:   clientID,
+		State:      dto.TicketState(config.InitialState),
+		AreaID:     config.DefaultAreaID,
+		DeadlineAt: nextDeadline(initial, time.Now()),
 		OpeningEvent: dto.NewTicketEvent{
 			// The id below belongs to the ticket, not to the event: the event's
 			// own id is the AUTOINCREMENT key the database assigns.
@@ -432,19 +505,30 @@ func normalizeTicketQuery(query dto.TicketQuery) dto.TicketQuery {
 // A CLOSED ticket rejects the note: "ticket nuevo solo cuando el anterior está
 // cerrado" (RF5). Reopening a closed conversation by writing into it would erase
 // the very boundary the re-engagement policy is built on, so the client is told
-// to open a new ticket instead. That rule is enforced TWICE: read here for the
-// readable rejection, and again by the open-state guard inside the repository
-// transaction, which is what makes it hold under concurrency.
+// to open a new ticket instead.
+//
+// "Closed" is CONFIGURATION since F2 (rider R3-001): a state is terminal when the
+// ticket's type declares no transition out of it (domain.WorkflowConfig.
+// IsTerminal), and the fixed 'cerrado' value is gone. The rule is enforced TWICE:
+// read here for the readable rejection, and again by the guard inside the
+// repository transaction — derived from the same configured transitions — which
+// is what makes it hold under concurrency.
 type AddTicketNote struct {
-	tickets TicketStore
+	tickets   TicketStore
+	workflows domain.WorkflowConfigStore
 }
 
-// NewAddTicketNote wires the use case.
-func NewAddTicketNote(tickets TicketStore) (*AddTicketNote, error) {
+// NewAddTicketNote wires the use case. The workflow store is required because the
+// closed rule is read from the ticket's type configuration, not from a fixed
+// state name.
+func NewAddTicketNote(tickets TicketStore, workflows domain.WorkflowConfigStore) (*AddTicketNote, error) {
 	if tickets == nil {
 		return nil, errors.New("tickets: se requiere un TicketStore para anotar tickets")
 	}
-	return &AddTicketNote{tickets: tickets}, nil
+	if workflows == nil {
+		return nil, errors.New("tickets: se requiere un WorkflowConfigStore para anotar tickets")
+	}
+	return &AddTicketNote{tickets: tickets, workflows: workflows}, nil
 }
 
 // Execute appends the note and returns the ticket with its updated history.
@@ -485,7 +569,11 @@ func (uc *AddTicketNote) Execute(ctx context.Context, caller auth.Caller, note d
 		return dto.TicketNoteResult{}, errTicketNotFound
 	}
 
-	if ticket.State.Closed() {
+	config, err := loadWorkflow(ctx, uc.workflows, ticket.TicketType)
+	if err != nil {
+		return dto.TicketNoteResult{}, err
+	}
+	if config.IsTerminal(string(ticket.State)) {
 		return dto.TicketNoteResult{}, errTicketClosed
 	}
 
@@ -495,8 +583,7 @@ func (uc *AddTicketNote) Execute(ctx context.Context, caller auth.Caller, note d
 	}
 
 	updated, applied, err := uc.tickets.AddTicketNote(ctx, dto.TicketNoteAppend{
-		TicketID:    ticket.ID,
-		ClosedState: dto.TicketStateClosed,
+		TicketID: ticket.ID,
 		Event: dto.NewTicketEvent{
 			TicketID: ticket.ID,
 			Actor:    ticketActor(caller),
@@ -534,44 +621,57 @@ func (uc *AddTicketNote) rejectStaleNote(ctx context.Context, ticketID string) e
 	if !found {
 		return errTicketNotFound
 	}
-	if ticket.State.Closed() {
+	config, err := loadWorkflow(ctx, uc.workflows, ticket.TicketType)
+	if err != nil {
+		return err
+	}
+	if config.IsTerminal(string(ticket.State)) {
 		return errTicketClosed
 	}
-	// Unreachable in F1 (the only refused state is the closed one) and kept as the
-	// honest fallback of a guard whose reason we cannot name.
+	// Unreachable while the guard and IsTerminal are the same rule (the guard
+	// refused because the state is terminal); kept as the honest fallback of a
+	// guard whose reason we cannot name.
 	return newSemanticError(CodeTicketStateChanged,
 		"el ticket cambió mientras lo operabas: volvé a leerlo e intentá de nuevo.")
 }
 
-// TransitionTicket is the staff transition of RF5 behind transition_ticket.
+// TransitionTicket is the transition of RF5 behind transition_ticket, executed by
+// the configured workflow of the ticket's type (RF6).
 //
-// F1 validates the target state against the fixed vocabulary and nothing else: it
-// does not implement a workflow. Which transitions are legal, who may execute
-// them and what fires on enter/exit is the F2 engine (RF6), configured per ticket
-// type. What F1 does guarantee is the audit: the state change and its event (with
-// actor, from and to) are written in one transaction, so the history can never
-// show a transition that did not happen or miss one that did.
+// F1 validated the target state against a fixed vocabulary; F2 asks the type's
+// configuration instead — is the destination a declared state? does the config
+// declare this exact from→to transition? — and refuses anything else, so the
+// engine can never move a ticket along an edge nobody configured. The audit is
+// unchanged: the state change and its event (with actor, from and to) are written
+// in one transaction, so the history can never show a transition that did not
+// happen or miss one that did.
 type TransitionTicket struct {
-	tickets TicketStore
+	tickets   TicketStore
+	workflows domain.WorkflowConfigStore
+	rotation  AreaRotator
 }
 
-// NewTransitionTicket wires the use case.
-func NewTransitionTicket(tickets TicketStore) (*TransitionTicket, error) {
+// NewTransitionTicket wires the use case. Every port is fail-closed: without the
+// workflow store there is no engine (only a fixed vocabulary, which F2 retired),
+// and without the rotation the round-robin rule of a configured transition could
+// not resolve an assignee.
+func NewTransitionTicket(tickets TicketStore, workflows domain.WorkflowConfigStore, rotation AreaRotator) (*TransitionTicket, error) {
 	if tickets == nil {
 		return nil, errors.New("tickets: se requiere un TicketStore para transicionar tickets")
 	}
-	return &TransitionTicket{tickets: tickets}, nil
+	if workflows == nil {
+		return nil, errors.New("tickets: se requiere un WorkflowConfigStore para transicionar tickets")
+	}
+	if rotation == nil {
+		return nil, errors.New("tickets: se requiere un AreaRotator para transicionar tickets")
+	}
+	return &TransitionTicket{tickets: tickets, workflows: workflows, rotation: rotation}, nil
 }
 
-// Execute moves the ticket to cmd.State.
+// Execute moves the ticket through the transition the workflow declares.
 func (uc *TransitionTicket) Execute(ctx context.Context, caller auth.Caller, cmd dto.TransitionCommand) (dto.TransitionTicketResult, error) {
 	if err := requireTicketOperator(caller); err != nil {
 		return dto.TransitionTicketResult{}, err
-	}
-
-	if !cmd.State.Valid() {
-		return dto.TransitionTicketResult{}, invalidTicketStateError(
-			"el estado destino no es válido: en F1 los estados posibles son nuevo, atendido y cerrado.")
 	}
 
 	ticketID := strings.TrimSpace(cmd.TicketID)
@@ -586,12 +686,62 @@ func (uc *TransitionTicket) Execute(ctx context.Context, caller auth.Caller, cmd
 	if !found {
 		return dto.TransitionTicketResult{}, errTicketNotFound
 	}
-	if ticket.State == cmd.State {
-		return dto.TransitionTicketResult{}, invalidTicketStateError(fmt.Sprintf(
-			"el ticket ya está en el estado %q.", string(cmd.State)))
+
+	config, err := loadWorkflow(ctx, uc.workflows, ticket.TicketType)
+	if err != nil {
+		return dto.TransitionTicketResult{}, err
 	}
 
-	payload, err := encodeTicketEventPayload(ticketTransitionPayload{From: ticket.State, To: cmd.State})
+	target := dto.TicketState(strings.TrimSpace(string(cmd.State)))
+	if target == "" {
+		return dto.TransitionTicketResult{}, invalidTicketStateError("indicá el estado destino del ticket.")
+	}
+	// One lookup answers both questions about the destination: does the type
+	// declare it, and (when it does) what deadline does it carry.
+	destination, declared := config.State(string(target))
+	if !declared {
+		return dto.TransitionTicketResult{}, invalidTicketStateError(fmt.Sprintf(
+			"el estado '%s' no existe en el workflow del tipo '%s'.", target, config.TypeName))
+	}
+	if ticket.State == target {
+		return dto.TransitionTicketResult{}, invalidTicketStateError(fmt.Sprintf(
+			"el ticket ya está en el estado '%s'.", target))
+	}
+
+	transition, declared := config.Transition(string(ticket.State), string(target))
+	if !declared {
+		return dto.TransitionTicketResult{}, invalidTicketStateError(fmt.Sprintf(
+			"no se puede pasar el ticket del estado '%s' al '%s': esa transición no está declarada en el workflow del tipo '%s'.",
+			ticket.State, target, config.TypeName))
+	}
+
+	// RF6: "rol autorizado por transición". The transport and requireTicketOperator
+	// already narrowed the caller to an internal role; this is the PER-TRANSITION
+	// minimum the Owner configured, and a role below it is refused with the
+	// semantic role rejection (a client never gets here: it is not a transition
+	// role at all, so the same check would refuse it before this message).
+	if !transition.CanBeExecutedBy(transitionRoleOf(caller.Role)) {
+		return dto.TransitionTicketResult{}, newSemanticError(CodeRoleNotAllowed, fmt.Sprintf(
+			"tu rol no permite pasar un ticket del estado '%s' al '%s': el workflow del tipo '%s' reserva esa transición al rol %s o superior.",
+			ticket.State, target, config.TypeName, transition.MinRole))
+	}
+
+	// RF6: "auto-asignación round-robin del área". The rotation is asked only when
+	// the transition declares it AND the ticket sits in an area; an area with no
+	// members answers "" and the ticket stays in the queue.
+	assignee := ""
+	if transition.RoundRobin && ticket.AreaID != "" {
+		assignee, err = uc.rotation.NextAreaAssignee(ctx, ticket.AreaID)
+		if err != nil {
+			return dto.TransitionTicketResult{}, fmt.Errorf("tickets: resolver el asignado del área: %w", err)
+		}
+	}
+
+	payload, err := encodeTicketEventPayload(ticketTransitionPayload{
+		From:       ticket.State,
+		To:         target,
+		AssignedTo: assignee,
+	})
 	if err != nil {
 		return dto.TransitionTicketResult{}, fmt.Errorf("tickets: transicionar el ticket: %w", err)
 	}
@@ -599,7 +749,12 @@ func (uc *TransitionTicket) Execute(ctx context.Context, caller auth.Caller, cmd
 	applied, err := uc.tickets.TransitionTicket(ctx, dto.TicketTransition{
 		TicketID: ticket.ID,
 		From:     ticket.State,
-		To:       cmd.State,
+		To:       target,
+		// The three computed columns are configuration answers, decided here and
+		// written by the adapter in the same guarded statement as the state.
+		DeadlineAt: nextDeadline(destination, time.Now()),
+		Closes:     config.IsTerminal(string(target)),
+		AssignTo:   assignee,
 		Event: dto.NewTicketEvent{
 			TicketID: ticket.ID,
 			Actor:    ticketActor(caller),
@@ -636,11 +791,13 @@ func (uc *TransitionTicket) Execute(ctx context.Context, caller auth.Caller, cmd
 // payload key cannot be invented at a call site, and so the audit of a kind always
 // has the same shape.
 type (
-	// ticketCreatedPayload is the opening event of a ticket.
+	// ticketCreatedPayload is the opening event of a ticket. It names the type by
+	// its configured NAME, not by its internal UUID: the type is what the engine
+	// loads the config by, and the name survives a re-seeded row.
 	ticketCreatedPayload struct {
-		TicketTypeID string          `json:"ticket_type_id"`
-		State        dto.TicketState `json:"state"`
-		Motive       string          `json:"motive"`
+		TicketType string          `json:"ticket_type"`
+		State      dto.TicketState `json:"state"`
+		Motive     string          `json:"motive"`
 	}
 
 	// ticketNotePayload is a note or re-engagement message.
@@ -648,10 +805,13 @@ type (
 		Text string `json:"text"`
 	}
 
-	// ticketTransitionPayload is a state change.
+	// ticketTransitionPayload is a state change. AssignedTo is present only when
+	// the transition's round-robin rule assigned the ticket: RF5 audits every
+	// assignment change, and the assignment happens as part of the transition.
 	ticketTransitionPayload struct {
-		From dto.TicketState `json:"from"`
-		To   dto.TicketState `json:"to"`
+		From       dto.TicketState `json:"from"`
+		To         dto.TicketState `json:"to"`
+		AssignedTo string          `json:"assigned_to,omitempty"`
 	}
 )
 
@@ -777,4 +937,91 @@ func isPhoneSeparator(r rune) bool {
 		return true
 	}
 	return false
+}
+
+// --- The engine's boundary helpers -----------------------------------------
+
+// loadWorkflow resolves the configuration of a ticket type and proves it is
+// executable before anything is written.
+//
+// The two rejections are deliberately different:
+//
+//   - the type does not exist (found=false): no business configured it, so the
+//     engine fails closed with "no existe el tipo de ticket" instead of falling
+//     back to a fixed vocabulary (RF6 retired it).
+//   - the type exists but its stored config does not validate: the engine refuses
+//     to execute half a workflow, and the rejection carries the domain's own
+//     Spanish message (which names the broken part) so the Owner can fix it.
+//
+// An empty name is the input default (the general consultation), never a
+// fallback for a config that is missing.
+func loadWorkflow(ctx context.Context, workflows domain.WorkflowConfigStore, typeName string) (domain.WorkflowConfig, error) {
+	typeName = strings.TrimSpace(typeName)
+	if typeName == "" {
+		typeName = defaultTicketTypeName
+	}
+
+	config, found, err := workflows.LoadConfig(ctx, typeName)
+	if err != nil {
+		return domain.WorkflowConfig{}, fmt.Errorf("tickets: leer el workflow del tipo %q: %w", typeName, err)
+	}
+	if !found {
+		return domain.WorkflowConfig{}, newSemanticError(CodeUnknownTicketType, fmt.Sprintf(
+			"no existe el tipo de ticket '%s'.", typeName))
+	}
+	if err := config.Validate(); err != nil {
+		return domain.WorkflowConfig{}, newSemanticError(CodeUnusableWorkflow, fmt.Sprintf(
+			"el workflow del tipo '%s' no se puede ejecutar: %s", typeName, configErrorMessage(err)))
+	}
+	return config, nil
+}
+
+// configErrorMessage renders the domain's validation message. The error is always
+// a semantic one (Validate phrases every rejection with NewSemanticError), and the
+// fallback exists only so a future non-semantic cause cannot leak internals into
+// the rejection.
+func configErrorMessage(err error) string {
+	var semantic *domain.SemanticError
+	if errors.As(err, &semantic) {
+		return semantic.Message()
+	}
+	return "la configuración no es válida."
+}
+
+// transitionRoleOf maps a resolved auth.Role onto the domain's transition-role
+// vocabulary.
+//
+// The mapping lives here because the dependency rule forbids internal/domain from
+// importing internal/auth: the domain names the roles a transition may require
+// (staff < admin < owner) and this boundary names the roles a caller can hold. A
+// client — and an unresolved caller — maps to the empty value, which is not a
+// transition role at all, so TransitionConfig.CanBeExecutedBy refuses it without a
+// special case. That is the RF6 criterion ("cuando un client intenta ejecutarla,
+// entonces es rechazada con FORBIDDEN semántico") executed as a role comparison
+// instead of as a role special case.
+func transitionRoleOf(role auth.Role) domain.TransitionRole {
+	switch role {
+	case auth.RoleStaff:
+		return domain.TransitionRoleStaff
+	case auth.RoleAdmin:
+		return domain.TransitionRoleAdmin
+	case auth.RoleOwner:
+		return domain.TransitionRoleOwner
+	default:
+		return ""
+	}
+}
+
+// nextDeadline is the deadline of a ticket that enters state at now: the state's
+// deadline_hours added to the instant of the transition (RF6: "`deadline` por
+// estado con aviso overdue").
+//
+// An empty answer means the state declares no deadline, which the column stores as
+// NULL — and which CLEARS the deadline of the previous state, so the scheduler
+// never compares an instant that belongs to a state the ticket already left.
+func nextDeadline(state domain.StateConfig, now time.Time) string {
+	if state.DeadlineHours == nil {
+		return ""
+	}
+	return now.UTC().Add(time.Duration(*state.DeadlineHours) * time.Hour).Format(ticketTimestampLayout)
 }

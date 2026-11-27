@@ -47,6 +47,16 @@ func newTicketFixture(t *testing.T) *ticketFixture {
 	}
 }
 
+// The state names the seeded 'consulta' template declares (PRD §3.7: "'consulta':
+// nuevo → atendido → resuelto"). They are values of that configuration, not a
+// vocabulary: the adapter validates nothing against them, and the closed rule is
+// derived from the configured transitions.
+const (
+	stateNew      dto.TicketState = "nuevo"
+	stateAttended dto.TicketState = "atendido"
+	stateResolved dto.TicketState = "resuelto"
+)
+
 // openTicket is the fixture shape of a created ticket.
 type openTicket struct {
 	id       string
@@ -59,7 +69,7 @@ func (f *ticketFixture) createTicket(t *testing.T, ticket openTicket) {
 	t.Helper()
 
 	if ticket.state == "" {
-		ticket.state = dto.TicketStateInitial
+		ticket.state = stateNew
 	}
 	motive, err := json.Marshal(map[string]string{"motive": "consulta por corte de pelo"})
 	if err != nil {
@@ -67,10 +77,10 @@ func (f *ticketFixture) createTicket(t *testing.T, ticket openTicket) {
 	}
 
 	err = f.repo.CreateTicket(context.Background(), dto.NewTicket{
-		ID:           ticket.id,
-		TicketTypeID: dto.ConsultaTicketTypeID,
-		ClientID:     ticket.clientID,
-		State:        ticket.state,
+		ID:         ticket.id,
+		TicketType: dto.ConsultaTicketTypeName,
+		ClientID:   ticket.clientID,
+		State:      ticket.state,
 		OpeningEvent: dto.NewTicketEvent{
 			TicketID: ticket.id,
 			Actor:    ticket.clientID,
@@ -94,10 +104,14 @@ func TestNewTicketsRepoRejectsNilHandle(t *testing.T) {
 	}
 }
 
-// TestTicketConstantsMirrorTheSchema pins the two mirrors the application layer
-// owns: the fixed F1 ticket type and the initial state. The application layer must
-// not import the persistence adapter, so the values are duplicated — and this test
-// is what keeps the duplication from drifting away from the seeded DDL.
+// TestTicketConstantsMirrorTheSchema pins the mirror the application layer owns:
+// the seeded 'consulta' ticket type. The application layer must not import the
+// persistence adapter, so the values are duplicated — and this test is what keeps
+// the duplication from drifting away from the seeded DDL.
+//
+// The STATE vocabulary is no longer mirrored (F2 T3): a ticket's states are the
+// ones its type configures, so there is no fixed list to compare against. What
+// this test still pins is that the seeded types exist and are active.
 func TestTicketConstantsMirrorTheSchema(t *testing.T) {
 	if dto.ConsultaTicketTypeID != db.TicketTypeConsultaID {
 		t.Fatalf("dto.ConsultaTicketTypeID = %q, se esperaba %q", dto.ConsultaTicketTypeID, db.TicketTypeConsultaID)
@@ -105,8 +119,8 @@ func TestTicketConstantsMirrorTheSchema(t *testing.T) {
 	if dto.ConsultaTicketTypeName != db.TicketTypeConsultaName {
 		t.Fatalf("dto.ConsultaTicketTypeName = %q, se esperaba %q", dto.ConsultaTicketTypeName, db.TicketTypeConsultaName)
 	}
-	if dto.TicketStateInitial != dto.TicketState(db.TicketStateInitial) {
-		t.Fatalf("dto.TicketStateInitial = %q, se esperaba %q", dto.TicketStateInitial, db.TicketStateInitial)
+	if string(stateNew) != db.TicketStateInitial {
+		t.Fatalf("el estado inicial de la plantilla = %q, se esperaba %q", stateNew, db.TicketStateInitial)
 	}
 
 	handle := openDB(t)
@@ -118,22 +132,17 @@ func TestTicketConstantsMirrorTheSchema(t *testing.T) {
 		t.Fatalf("is_active = %q, se esperaba el tipo sembrado activo", active)
 	}
 
-	// The F1 vocabulary is exactly the three states the use cases accept.
-	for _, state := range []dto.TicketState{dto.TicketStateNew, dto.TicketStateAttended, dto.TicketStateClosed} {
-		if !state.Valid() {
-			t.Fatalf("%q no es un estado válido de F1", state)
+	// The states the fixture speaks are the ones the seeded config declares, and
+	// the ending of the conversation is the template's terminal state.
+	for _, state := range []dto.TicketState{stateNew, stateAttended, stateResolved} {
+		if got := queryScalar(t, handle, `SELECT COUNT(*) FROM ticket_states WHERE name = ? AND ticket_type_id = ?`, state, db.TicketTypeConsultaID); got != "1" {
+			t.Fatalf("%q no es un estado declarado por la plantilla 'consulta' (count=%s)", state, got)
 		}
-	}
-	if dto.TicketState("en-proceso").Valid() {
-		t.Fatal("un estado fuera del vocabulario F1 se declaró válido")
-	}
-	if dto.TicketStateClosed.Open() || !dto.TicketStateNew.Open() || !dto.TicketStateAttended.Open() {
-		t.Fatal("Open() debe ser falso solo para el estado cerrado")
 	}
 }
 
 // TestCreateTicketWritesTicketAndOpeningEvent pins RF5's creation criterion: the
-// ticket exists in the initial state of the (single) type and its creation event
+// ticket exists in the configured initial state of its type and its creation event
 // is audited with actor and timestamp.
 func TestCreateTicketWritesTicketAndOpeningEvent(t *testing.T) {
 	fixture := newTicketFixture(t)
@@ -148,8 +157,8 @@ func TestCreateTicketWritesTicketAndOpeningEvent(t *testing.T) {
 	if !found {
 		t.Fatalf("GetTicket(%s) no encontró el ticket recién creado", id)
 	}
-	if record.State != dto.TicketStateInitial {
-		t.Fatalf("state = %q, se esperaba %q", record.State, dto.TicketStateInitial)
+	if record.State != stateNew {
+		t.Fatalf("state = %q, se esperaba %q", record.State, stateNew)
 	}
 	if record.TicketTypeID != db.TicketTypeConsultaID {
 		t.Fatalf("ticket_type_id = %q, se esperaba el tipo sembrado %q", record.TicketTypeID, db.TicketTypeConsultaID)
@@ -198,9 +207,9 @@ func TestCreateTicketIsAtomic(t *testing.T) {
 
 	err := fixture.repo.CreateTicket(context.Background(), dto.NewTicket{
 		ID:           id,
-		TicketTypeID: uuid(999), // no existe en ticket_types
+		TicketType:   "no-existe", // no existe en ticket_types
 		ClientID:     fixture.client,
-		State:        dto.TicketStateInitial,
+		State:        stateNew,
 		OpeningEvent: dto.NewTicketEvent{Actor: fixture.client, Kind: dto.TicketEventKindCreated},
 	})
 	if err == nil {
@@ -330,7 +339,7 @@ func TestListTicketsFilters(t *testing.T) {
 	closedOne := uuid(711)
 	openOther := uuid(712)
 	fixture.createTicket(t, openTicket{id: openOne, clientID: fixture.client})
-	fixture.createTicket(t, openTicket{id: closedOne, clientID: fixture.client, state: dto.TicketStateClosed})
+	fixture.createTicket(t, openTicket{id: closedOne, clientID: fixture.client, state: stateResolved})
 	fixture.createTicket(t, openTicket{id: openOther, clientID: fixture.other})
 
 	t.Run("cliente sin cerrados", func(t *testing.T) {
@@ -412,8 +421,8 @@ func TestTransitionTicketIsGuarded(t *testing.T) {
 	payload := `{"from":"nuevo","to":"atendido"}`
 	applied, err := fixture.repo.TransitionTicket(ctx, dto.TicketTransition{
 		TicketID: id,
-		From:     dto.TicketStateNew,
-		To:       dto.TicketStateAttended,
+		From:     stateNew,
+		To:       stateAttended,
 		Event:    dto.NewTicketEvent{Actor: uuid(50), Kind: dto.TicketEventKindTransition, Payload: payload},
 	})
 	if err != nil {
@@ -427,8 +436,8 @@ func TestTransitionTicketIsGuarded(t *testing.T) {
 	if err != nil || !found {
 		t.Fatalf("GetTicket() = %t, %v", found, err)
 	}
-	if record.State != dto.TicketStateAttended {
-		t.Fatalf("state = %q, se esperaba %q", record.State, dto.TicketStateAttended)
+	if record.State != stateAttended {
+		t.Fatalf("state = %q, se esperaba %q", record.State, stateAttended)
 	}
 
 	events, err := fixture.repo.ListTicketEvents(ctx, id)
@@ -449,8 +458,8 @@ func TestTransitionTicketIsGuarded(t *testing.T) {
 	// The same `from` is now stale: the guarded update applies nothing.
 	applied, err = fixture.repo.TransitionTicket(ctx, dto.TicketTransition{
 		TicketID: id,
-		From:     dto.TicketStateNew,
-		To:       dto.TicketStateClosed,
+		From:     stateNew,
+		To:       stateResolved,
 		Event:    dto.NewTicketEvent{Actor: uuid(50), Kind: dto.TicketEventKindTransition},
 	})
 	if err != nil {
@@ -464,8 +473,8 @@ func TestTransitionTicketIsGuarded(t *testing.T) {
 	if err != nil {
 		t.Fatalf("GetTicket() error inesperado: %v", err)
 	}
-	if afterStale.State != dto.TicketStateAttended {
-		t.Fatalf("state = %q, se esperaba que siguiera en %q", afterStale.State, dto.TicketStateAttended)
+	if afterStale.State != stateAttended {
+		t.Fatalf("state = %q, se esperaba que siguiera en %q", afterStale.State, stateAttended)
 	}
 	staleEvents, err := fixture.repo.ListTicketEvents(ctx, id)
 	if err != nil {
@@ -479,8 +488,8 @@ func TestTransitionTicketIsGuarded(t *testing.T) {
 	// event, no state.
 	applied, err = fixture.repo.TransitionTicket(ctx, dto.TicketTransition{
 		TicketID: uuid(721),
-		From:     dto.TicketStateNew,
-		To:       dto.TicketStateAttended,
+		From:     stateNew,
+		To:       stateAttended,
 		Event:    dto.NewTicketEvent{Actor: uuid(50), Kind: dto.TicketEventKindTransition},
 	})
 	if err != nil {
@@ -512,9 +521,8 @@ func TestAddTicketNoteWritesEventAndActivity(t *testing.T) {
 
 	payload := `{"text":"vuelvo por lo mismo"}`
 	record, applied, err := fixture.repo.AddTicketNote(ctx, dto.TicketNoteAppend{
-		TicketID:    id,
-		ClosedState: dto.TicketStateClosed,
-		Event:       dto.NewTicketEvent{Actor: uuid(51), Kind: dto.TicketEventKindNote, Payload: payload},
+		TicketID: id,
+		Event:    dto.NewTicketEvent{Actor: uuid(51), Kind: dto.TicketEventKindNote, Payload: payload},
 	})
 	if err != nil {
 		t.Fatalf("AddTicketNote() error inesperado: %v", err)
@@ -556,7 +564,7 @@ func TestAddTicketNoteRefusesAClosedTicket(t *testing.T) {
 	fixture := newTicketFixture(t)
 	ctx := context.Background()
 	id := uuid(726)
-	fixture.createTicket(t, openTicket{id: id, clientID: fixture.client, state: dto.TicketStateClosed})
+	fixture.createTicket(t, openTicket{id: id, clientID: fixture.client, state: stateResolved})
 
 	before, found, err := fixture.repo.GetTicket(ctx, id)
 	if err != nil || !found {
@@ -565,9 +573,8 @@ func TestAddTicketNoteRefusesAClosedTicket(t *testing.T) {
 	time.Sleep(3 * time.Millisecond)
 
 	note := dto.TicketNoteAppend{
-		TicketID:    id,
-		ClosedState: dto.TicketStateClosed,
-		Event:       dto.NewTicketEvent{Actor: fixture.client, Kind: dto.TicketEventKindNote},
+		TicketID: id,
+		Event:    dto.NewTicketEvent{Actor: fixture.client, Kind: dto.TicketEventKindNote},
 	}
 	if _, applied, err := fixture.repo.AddTicketNote(ctx, note); err != nil || applied {
 		t.Fatalf("AddTicketNote(ticket cerrado) = %t, %v; se esperaba false sin error", applied, err)
@@ -610,9 +617,8 @@ func TestAddTicketNoteRollsBackAFailedAppend(t *testing.T) {
 		t.Fatalf("romper la tabla de eventos: %v", err)
 	}
 	if _, _, err := fixture.repo.AddTicketNote(ctx, dto.TicketNoteAppend{
-		TicketID:    id,
-		ClosedState: dto.TicketStateClosed,
-		Event:       dto.NewTicketEvent{Actor: fixture.client, Kind: dto.TicketEventKindNote},
+		TicketID: id,
+		Event:    dto.NewTicketEvent{Actor: fixture.client, Kind: dto.TicketEventKindNote},
 	}); err == nil {
 		t.Fatal("AddTicketNote() debía fallar con la tabla de eventos ausente")
 	}
@@ -627,9 +633,9 @@ func TestAddTicketNoteRollsBackAFailedAppend(t *testing.T) {
 }
 
 // TestAddTicketNoteRejectsBrokenInput pins that the adapter refuses what cannot
-// be written BEFORE a transaction exists: an unknown "closed" state would make
-// the guard accept every row, so it is a programming error and not a business
-// rejection.
+// be written BEFORE a transaction exists. The guard needs no state argument any
+// more (it derives terminality from the configured transitions), so what remains
+// refusable is the event itself.
 func TestAddTicketNoteRejectsBrokenInput(t *testing.T) {
 	fixture := newTicketFixture(t)
 	id := uuid(729)
@@ -640,23 +646,15 @@ func TestAddTicketNoteRejectsBrokenInput(t *testing.T) {
 		note dto.TicketNoteAppend
 	}{
 		{"sin ticket", dto.TicketNoteAppend{
-			ClosedState: dto.TicketStateClosed,
-			Event:       dto.NewTicketEvent{Actor: fixture.client, Kind: dto.TicketEventKindNote},
-		}},
-		{"estado de cierre desconocido", dto.TicketNoteAppend{
-			TicketID:    id,
-			ClosedState: "archivado",
-			Event:       dto.NewTicketEvent{Actor: fixture.client, Kind: dto.TicketEventKindNote},
+			Event: dto.NewTicketEvent{Actor: fixture.client, Kind: dto.TicketEventKindNote},
 		}},
 		{"sin actor", dto.TicketNoteAppend{
-			TicketID:    id,
-			ClosedState: dto.TicketStateClosed,
-			Event:       dto.NewTicketEvent{Kind: dto.TicketEventKindNote},
+			TicketID: id,
+			Event:    dto.NewTicketEvent{Kind: dto.TicketEventKindNote},
 		}},
 		{"payload inválido", dto.TicketNoteAppend{
-			TicketID:    id,
-			ClosedState: dto.TicketStateClosed,
-			Event:       dto.NewTicketEvent{Actor: fixture.client, Kind: dto.TicketEventKindNote, Payload: "{no es json"},
+			TicketID: id,
+			Event:    dto.NewTicketEvent{Actor: fixture.client, Kind: dto.TicketEventKindNote, Payload: "{no es json"},
 		}},
 	}
 	for _, tc := range cases {
@@ -740,8 +738,8 @@ func TestTicketsRepoPropagatesDatabaseFailure(t *testing.T) {
 	}
 	if _, err := fixture.repo.TransitionTicket(ctx, dto.TicketTransition{
 		TicketID: id,
-		From:     dto.TicketStateNew,
-		To:       dto.TicketStateClosed,
+		From:     stateNew,
+		To:       stateResolved,
 		Event:    dto.NewTicketEvent{Actor: fixture.client, Kind: dto.TicketEventKindTransition},
 	}); err == nil {
 		t.Fatal("TransitionTicket() debía fallar con la tabla ausente")

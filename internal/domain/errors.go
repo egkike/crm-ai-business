@@ -81,6 +81,18 @@ const (
 
 	// CodeClientNotFound: the ticket names a client no row carries.
 	CodeClientNotFound ErrorCode = "client_not_found"
+
+	// CodeUnknownTicketType: the ticket names a type the business does not
+	// configure. Since F2 the ticket types are configuration (RF6), so a type
+	// nobody declared has no states, no transitions and no engine — the engine
+	// fails closed instead of falling back to a fixed vocabulary.
+	CodeUnknownTicketType ErrorCode = "unknown_ticket_type"
+
+	// CodeUnusableWorkflow: the type exists but the configuration stored for it
+	// cannot be executed (it does not validate). It is the fail-closed answer of
+	// an engine whose rules would otherwise be guessed: the ticket is refused
+	// with a Spanish rejection instead of being moved by half a workflow.
+	CodeUnusableWorkflow ErrorCode = "unusable_workflow"
 )
 
 // SemanticError is the user-facing failure of a business rule.

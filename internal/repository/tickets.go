@@ -19,28 +19,58 @@ import (
 // The ticket statements. Each one is a constant, parameterized with '?', and no
 // caller value ever reaches the SQL text.
 const (
+	// insertTicket resolves the ticket type by NAME while it inserts. The engine
+	// addresses a type by name (the configuration is keyed by name), so the use
+	// case never handles the type's internal UUID; a name no row carries inserts
+	// nothing, which the adapter reports instead of writing a ticket whose type
+	// does not exist.
 	insertTicket = `
-INSERT INTO tickets (id, ticket_type_id, client_id, state) VALUES (?, ?, ?, ?)`
+INSERT INTO tickets (id, ticket_type_id, client_id, state, area_id, deadline_at)
+SELECT ?, tt.id, ?, ?, ?, ? FROM ticket_types tt WHERE tt.name = ?`
 
 	// ticketColumns is the projection every ticket read shares, so the carrier is
-	// filled by one scan helper and cannot drift between queries.
-	ticketColumns = `id, ticket_type_id, client_id, state, assigned_to, created_at, updated_at`
+	// filled by one scan helper and cannot drift between queries. It joins the
+	// type for its NAME: that is the key the workflow engine loads the config by.
+	ticketColumns = `t.id, t.ticket_type_id, tt.name, t.client_id, t.state, t.assigned_to, ` +
+		`t.area_id, t.deadline_at, t.closed_at, t.created_at, t.updated_at`
 
-	selectTicketByID = `SELECT ` + ticketColumns + ` FROM tickets WHERE id = ?`
+	// ticketSource is the qualified FROM every ticket read shares.
+	ticketSource = ` FROM tickets t JOIN ticket_types tt ON tt.id = t.ticket_type_id`
+
+	selectTicketByID = `SELECT ` + ticketColumns + ticketSource + ` WHERE t.id = ?`
+
+	// ticketIsOpen is the configuration-derived definition of "open": a ticket is
+	// open while its current state has at least one outgoing transition. It is
+	// the SQL form of domain.WorkflowConfig.IsTerminal (terminal = no outgoing
+	// transition), which is why the closed semantics survive the death of the
+	// fixed vocabulary (rider R3-001): nothing here names a state, so a renamed or
+	// reconfigured terminal state is picked up without touching a statement.
+	//
+	// It is a non-correlated set membership: the pair (type, state) is looked up
+	// against the configured transitions as one IN-operator probe per candidate
+	// row, instead of a correlated EXISTS sub-plan per row. Measured at the
+	// declared ceiling (10k clients / 100k tickets) the business listing answers in
+	// ~90ms median (budget 200ms; ~122ms under -race), against the ~59ms of the
+	// retired `state <> 'cerrado'` literal: the difference is the cost of asking
+	// the CONFIGURATION instead of a constant, and it stays inside the budget the
+	// F1 index earned. If a future phase needs that margin back, the lever is the
+	// statement's mixed-direction ORDER BY (which forces the whole candidate set
+	// through a temp B-tree before LIMIT), not the rule itself.
+	//
+	// The sentence is fail-closed in the direction that matters: a type with no
+	// transitions declares no open state, so its tickets read as closed and
+	// accept no activity instead of accepting everything.
+	ticketIsOpen = `(t.ticket_type_id, t.state) IN ` +
+		`(SELECT ticket_type_id, from_state FROM ticket_transitions)`
 
 	// selectTickets is the single list statement of both views. Its filters are
 	// BOUND, not built: an empty client filter means "every client" and
 	// includeClosed=false means "open conversations only", so one statement serves
 	// the client view and the internal queue without a second dialect of SQL.
-	//
-	// The closed state travels as a parameter instead of a literal for the same
-	// reason the initial state of a ticket does: F1's state vocabulary is Go
-	// (dto.TicketState), and F2 replaces it with rows.
 	selectTickets = `
-SELECT ` + ticketColumns + `
-FROM tickets
-WHERE (? = 1 OR state <> ?)
-ORDER BY updated_at DESC, id
+SELECT ` + ticketColumns + ticketSource + `
+WHERE (? = 1 OR ` + ticketIsOpen + `)
+ORDER BY t.updated_at DESC, t.id
 LIMIT ? OFFSET ?`
 
 	// selectTicketsByClient is the client view as its own statement. It is not a
@@ -50,20 +80,36 @@ LIMIT ? OFFSET ?`
 	// measured 2.4s instrumented against a 200ms budget. Split, the client view
 	// seeks by client_id and the business view walks the activity index.
 	selectTicketsByClient = `
-SELECT ` + ticketColumns + `
-FROM tickets
-WHERE client_id = ?
-  AND (? = 1 OR state <> ?)
-ORDER BY updated_at DESC, id
+SELECT ` + ticketColumns + ticketSource + `
+WHERE t.client_id = ?
+  AND (? = 1 OR ` + ticketIsOpen + `)
+ORDER BY t.updated_at DESC, t.id
 LIMIT ? OFFSET ?`
 
 	// updateTicketStateGuarded is the single transition write. The `state = ?`
 	// predicate is the guard: the row is only changed if it is still in the state
 	// the use case read, so two concurrent actors cannot silently overwrite each
 	// other's transition (the loser gets found=false and a semantic rejection).
+	//
+	// The three computed columns travel with the state because they are functions
+	// of the DESTINATION state, and a partial write would leave the scheduler
+	// reading a deadline that belongs to the previous state:
+	//
+	//   - deadline_at is the destination's computed deadline (NULL when the state
+	//     declares none, which also CLEARS the previous one).
+	//   - closed_at is stamped when the destination is terminal in the type's
+	//     config; it is never cleared, because a terminal state has no outgoing
+	//     transition by definition, so no configured transition leaves it.
+	//   - assigned_to is rewritten only by the round-robin rule (an empty value
+	//     leaves the assignment as it is: an area without members assigns nobody
+	//     and the ticket stays in its queue).
 	updateTicketStateGuarded = `
 UPDATE tickets
-SET state = ?, updated_at = strftime('%Y-%m-%dT%H:%M:%fZ','now')
+SET state = ?,
+    deadline_at = ?,
+    closed_at = CASE WHEN ? = 1 THEN strftime('%Y-%m-%dT%H:%M:%fZ','now') ELSE closed_at END,
+    assigned_to = CASE WHEN ? = '' THEN assigned_to ELSE ? END,
+    updated_at = strftime('%Y-%m-%dT%H:%M:%fZ','now')
 WHERE id = ? AND state = ?`
 
 	// touchTicket records activity on the ticket. It does not change the state:
@@ -74,15 +120,19 @@ UPDATE tickets
 SET updated_at = strftime('%Y-%m-%dT%H:%M:%fZ','now')
 WHERE id = ?`
 
-	// touchOpenTicket records activity ONLY while the ticket is open. The
-	// `state <> ?` predicate is the guard of a note: the message of a
-	// conversation lands on an open ticket or it lands nowhere (a closed
-	// conversation is reopened by opening a new ticket, RF5). RowsAffected = 0 is
-	// therefore "the guard refused", exactly like updateTicketStateGuarded.
+	// touchOpenTicket records activity ONLY while the ticket is open. The guard is
+	// ticketIsOpen against the row being updated — spelled with the table name
+	// because an UPDATE has no alias here and the sub-select's own columns would
+	// otherwise shadow the row: the message of a conversation lands on an open
+	// ticket or it lands nowhere (a closed conversation is reopened by opening a
+	// new ticket, RF5). RowsAffected = 0 is therefore "the guard refused", exactly
+	// like updateTicketStateGuarded.
 	touchOpenTicket = `
 UPDATE tickets
 SET updated_at = strftime('%Y-%m-%dT%H:%M:%fZ','now')
-WHERE id = ? AND state <> ?`
+WHERE id = ?
+  AND (tickets.ticket_type_id, tickets.state) IN
+      (SELECT ticket_type_id, from_state FROM ticket_transitions)`
 
 	insertTicketEvent = `
 INSERT INTO ticket_events (ticket_id, actor, kind, payload) VALUES (?, ?, ?, ?)`
@@ -141,13 +191,26 @@ func (r *TicketsRepo) CreateTicket(ctx context.Context, ticket dto.NewTicket) er
 	// control flow.
 	defer func() { _ = tx.Rollback() }()
 
-	if _, err := tx.ExecContext(ctx, insertTicket,
+	inserted, err := tx.ExecContext(ctx, insertTicket,
 		ticket.ID,
-		ticket.TicketTypeID,
 		ticket.ClientID,
 		string(ticket.State),
-	); err != nil {
+		nullText(ticket.AreaID),
+		nullText(ticket.DeadlineAt),
+		ticket.TicketType,
+	)
+	if err != nil {
 		return fmt.Errorf("repositorio de tickets: insertar el ticket: %w", err)
+	}
+	// INSERT ... SELECT writes nothing when no type carries the name. The use
+	// case resolves the config first, so a missing type here is an internal
+	// inconsistency, never a business rejection.
+	affected, err := inserted.RowsAffected()
+	if err != nil {
+		return fmt.Errorf("repositorio de tickets: confirmar el alta del ticket: %w", err)
+	}
+	if affected == 0 {
+		return fmt.Errorf("repositorio de tickets: el tipo de ticket %q no existe", ticket.TicketType)
 	}
 
 	// The event is written against THIS ticket's id: the carrier's own TicketID is
@@ -219,13 +282,13 @@ func (r *TicketsRepo) queryTickets(ctx context.Context, clientID string, include
 	)
 	if clientID == "" {
 		rows, err = r.db.QueryContext(ctx, selectTickets,
-			includeClosedFlag, string(dto.TicketStateClosed),
+			includeClosedFlag,
 			limit, offset,
 		)
 	} else {
 		rows, err = r.db.QueryContext(ctx, selectTicketsByClient,
 			clientID,
-			includeClosedFlag, string(dto.TicketStateClosed),
+			includeClosedFlag,
 			limit, offset,
 		)
 	}
@@ -272,6 +335,10 @@ func (r *TicketsRepo) TransitionTicket(ctx context.Context, transition dto.Ticke
 
 	result, err := tx.ExecContext(ctx, updateTicketStateGuarded,
 		string(transition.To),
+		nullText(transition.DeadlineAt),
+		boolFlag(transition.Closes),
+		transition.AssignTo,
+		transition.AssignTo,
 		transition.TicketID,
 		string(transition.From),
 	)
@@ -398,7 +465,7 @@ func (r *TicketsRepo) AddTicketNote(ctx context.Context, note dto.TicketNoteAppe
 	// with the transaction.
 	defer func() { _ = tx.Rollback() }()
 
-	activity, err := tx.ExecContext(ctx, touchOpenTicket, note.TicketID, string(note.ClosedState))
+	activity, err := tx.ExecContext(ctx, touchOpenTicket, note.TicketID)
 	if err != nil {
 		return dto.TicketRecord{}, false, fmt.Errorf("repositorio de tickets: marcar la actividad de la nota: %w", err)
 	}
@@ -453,21 +520,29 @@ func (r *TicketsRepo) TouchTicket(ctx context.Context, id string) (bool, error) 
 	return affected > 0, nil
 }
 
-// scanTicket fills the carrier from one row. assigned_to is nullable (the
-// unassigned pool of RF5) and becomes the empty string, so no consumer ever sees
-// a sql.Null* type.
+// scanTicket fills the carrier from one row. assigned_to, area_id, deadline_at and
+// closed_at are nullable (the unassigned pool, "sin área fija", a state without a
+// deadline, an open conversation) and become the empty string, so no consumer
+// ever sees a sql.Null* type.
 func scanTicket(row scanner) (dto.TicketRecord, error) {
 	var (
 		record     dto.TicketRecord
 		state      string
 		assignedTo sql.NullString
+		areaID     sql.NullString
+		deadlineAt sql.NullString
+		closedAt   sql.NullString
 	)
 	if err := row.Scan(
 		&record.ID,
 		&record.TicketTypeID,
+		&record.TicketType,
 		&record.ClientID,
 		&state,
 		&assignedTo,
+		&areaID,
+		&deadlineAt,
+		&closedAt,
 		&record.CreatedAt,
 		&record.UpdatedAt,
 	); err != nil {
@@ -476,6 +551,9 @@ func scanTicket(row scanner) (dto.TicketRecord, error) {
 
 	record.State = dto.TicketState(state)
 	record.AssignedTo = assignedTo.String
+	record.AreaID = areaID.String
+	record.DeadlineAt = deadlineAt.String
+	record.ClosedAt = closedAt.String
 	return record, nil
 }
 
@@ -498,18 +576,22 @@ func scanTicketEvent(row scanner) (dto.TicketEventRecord, error) {
 // validateNewTicket rejects an incomplete row before it reaches the database.
 // These are programming errors (the application layer builds the row), so they are
 // internal and stay untranslated.
+//
+// The state is NOT validated against a vocabulary: since F2 the legal states are
+// the ones the ticket's type configures, and the adapter holds no config. What it
+// can reject is an empty row.
 func validateNewTicket(ticket dto.NewTicket) error {
 	if ticket.ID == "" {
 		return errors.New("repositorio de tickets: el ticket a crear no tiene id interno")
 	}
-	if ticket.TicketTypeID == "" {
+	if ticket.TicketType == "" {
 		return errors.New("repositorio de tickets: el ticket a crear no tiene tipo")
 	}
 	if ticket.ClientID == "" {
 		return errors.New("repositorio de tickets: el ticket a crear no tiene cliente")
 	}
-	if !ticket.State.Valid() {
-		return fmt.Errorf("repositorio de tickets: estado inicial desconocido %q", string(ticket.State))
+	if ticket.State == "" {
+		return errors.New("repositorio de tickets: el ticket a crear no tiene estado inicial")
 	}
 	return validateNewEvent(dto.NewTicketEvent{
 		TicketID: ticket.ID,
@@ -540,15 +622,14 @@ func validateTransition(transition dto.TicketTransition) error {
 }
 
 // validateNoteAppend rejects a note that cannot be written before a transaction
-// exists: the same rules the transition enforces, plus the state the guard
-// refuses (an unknown state would make `state <> ?` silently accept a closed
-// ticket).
+// exists.
+//
+// The guard needs no state argument any more: it is derived from the transitions
+// of the ticket's type, so there is no "closed state" a caller could name wrong
+// (rider R3-001). What remains checked is the event itself.
 func validateNoteAppend(note dto.TicketNoteAppend) error {
 	if note.TicketID == "" {
 		return errors.New("repositorio de tickets: la nota no tiene ticket")
-	}
-	if !note.ClosedState.Valid() {
-		return fmt.Errorf("repositorio de tickets: el estado que cierra la conversación es desconocido %q", string(note.ClosedState))
 	}
 	return validateNewEvent(dto.NewTicketEvent{
 		TicketID: note.TicketID,

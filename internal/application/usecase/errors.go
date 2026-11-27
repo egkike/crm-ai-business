@@ -35,6 +35,11 @@ const (
 	CodeTicketClosed       = domain.CodeTicketClosed
 	CodeTicketStateChanged = domain.CodeTicketStateChanged
 	CodeClientNotFound     = domain.CodeClientNotFound
+
+	// The engine's own classes (F2 T3): a type nobody configured, and a stored
+	// workflow that cannot be executed.
+	CodeUnknownTicketType = domain.CodeUnknownTicketType
+	CodeUnusableWorkflow  = domain.CodeUnusableWorkflow
 )
 
 // The sentinel semantic failures of the registration seam, re-exported as the
