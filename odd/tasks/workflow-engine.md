@@ -102,7 +102,7 @@ Quotes are VERBATIM from docs/PRD.md v1.12 — the RF text is the spec; never pa
 
 | ID | Specs | Route | Commit |
 |---|---|---|---|
-| T1 | S2, S9 | internal/domain birth: workflow config entities + `Validate` fail-closed + parity tests | — |
+| T1 | S2, S9 | internal/domain birth: workflow config entities + `Validate` fail-closed + parity tests | 9117c9b (move) + 86cbf8a (workflow) |
 | T2 | S9 | migration v5: `areas`, `ticket_types`, `ticket_states`, `ticket_transitions`, `alerts` + seeds 'venta'/'consulta' | — |
 | T3 | S1, S2 | engine: creation/transition/deadlines via config, round-robin, events audited, FORBIDDEN por rol | — |
 | T4 | S2, S3 | tools MCP de administración Owner: config de workflows por chat, doble gate destructivas, áreas CRUD | — |
@@ -168,3 +168,12 @@ Routes refined with the explorer code map (2026-11-27, evidence path:line):
   Test-fix note: the transition-cap test initially tripped the state cap first — the
   engine was right, the test construction was wrong (fixed: unique pairs within the
   50-state cap).
+- **L7** (2026-11-27, evidence): T1 RDD closed. Native assess (baseRef
+  0e08277a774c8440ca1a72ca4bdba2e4f71755d2): risk **high**, `reviewDue: true`
+  (reasons: `.golangci.yml` configuration change + agent escalation item 3 —
+  shared SemanticError machinery). Native review **review-8fc68db721abce52**
+  ran 3 lenses (risk/readability/reliability) → **approved**, receipt burned
+  (acknowledge-approved completed; verify-always-rdd-high satisfied: full
+  `-race` pipeline green + native review). 7 advisory findings, all
+  informational, none opened a correction → backlog entries R3-1/R3-2/R3-3
+  (Pending riders into T3/T4/T6), R2-001..R2-004 (next-touch/no-action).
