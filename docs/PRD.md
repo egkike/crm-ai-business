@@ -1,9 +1,9 @@
 # PRD: CRM-AI-Business
 
-> **Estado**: Aprobado (owner, 2026-11-26) — revisión v1.11 en curso
+> **Estado**: Aprobado (owner, 2026-11-26) — revisión v1.12 en curso
 > **Owner**: Kike
-> **Versión**: 1.11
-> **Última actualización**: 2026-11-26
+> **Versión**: 1.12
+> **Última actualización**: 2026-11-27
 
 ---
 
@@ -159,15 +159,20 @@ completitud del producto, no crecimiento de comunidad.
 - Binding de identidad interna por `telegram_user_id` (evolución futura documentada; v1 usa
   `request_contact` + teléfono).
 - 2FA TOTP en el login del panel (fase posterior, Could).
-- Reverse proxy/VPN como producto: el binario es siempre loopback; Caddy+HTTPS y
-  Tailscale/WireGuard son **recetas documentadas**, no entregables del binario.
+- Reverse proxy/VPN como producto: el binario es siempre loopback; Caddy+HTTPS,
+  Tailscale/WireGuard y Tailcat son **recetas documentadas**, no entregables del binario
+  (evolución futura documentada: embeber la librería Go `github.com/tailscale/tailcat`
+  como modo de túnel del panel, condicionada al vencimiento de la asunción de §3.3).
 
 ### 3.3 Asunciones
 
 - El equipo interno accede al panel por **túnel SSH** (por defecto) o por una receta opt-in
-  (Caddy+HTTPS / Tailscale) que cada dueño elige; un staff remoto sin acceso SSH requiere que
-  el dueño habilite una receta. Si esa asunción vence (staff remoto frecuente), se reabre la
-  decisión de exposición.
+  que cada dueño elige: **Tailcat** (recomendada para staff sin acceso SSH — túnel WireGuard
+  userspace de Tailscale, sin cuentas ni root ni puertos entrantes; la dirección es un bearer
+  capability, por lo que la receta obliga a pinnear claves de cliente con `--allow` y a
+  compartirla solo por canal privado) / Caddy+HTTPS / Tailscale; un staff remoto sin acceso
+  SSH requiere que el dueño habilite una receta. Si esa asunción vence (staff remoto
+  frecuente), se reabre la decisión de exposición.
 - Cada usuario interno tiene **teléfono registrado en su cuenta** (necesario para la
   resolución de identidad por Telegram) y usuario de Telegram activo.
 - Hermes está instalado como **vecino same-host** y su gateway cumple el contrato per-sender
@@ -618,7 +623,8 @@ de referencia):
 - **Descripción**: wizard interactivo + `install.sh` pineado por versión exacta con SHA256;
   servicio user-level (systemd/launchd) sin root; uninstall con dry-run por defecto y
   preservación de datos salvo `--purge-data` con doble gate; recetas de acceso remoto al
-  panel (túnel SSH / Caddy+HTTPS / Tailscale) documentadas como opt-in.
+  panel (túnel SSH / **Tailcat** — recomendada para staff sin SSH — / Caddy+HTTPS /
+  Tailscale) documentadas como opt-in.
 - **Prioridad**: Must (F6)
 
 > **Nota**: los criterios Gherkin de este PRD son la fuente canónica; al implementar
@@ -843,8 +849,8 @@ reglas declarativas — y el motor los ejecuta con avisos y deadlines.
 - Wizard interactivo + `install.sh` pineado con SHA256 + servicio user-level + uninstall
   (dry-run por defecto).
 - Documentación: instalación completa, **allowlist mínima de Hermes con comandos y prueba
-  final**, recetas de acceso remoto (túnel SSH / Caddy+HTTPS / Tailscale), deployment,
-  mantenimiento.
+  final**, recetas de acceso remoto (túnel SSH / **Tailcat** — recomendada para staff sin
+  SSH — / Caddy+HTTPS / Tailscale), deployment, mantenimiento.
 - **Skill de Hermes**: paso opcional del wizard de `install.sh` con consent explícito
   (template estático versionado del repo; igual que el viejo: consentimiento al escribir
   en el home de Hermes).
@@ -876,7 +882,7 @@ conversacional.
 | R3 | Complejidad del motor de workflows (configuraciones rotas que el Owner no sabe diagnosticar) | Media | Medio | Reglas declarativas acotadas (sin scripting), validación íntegra fail-closed con errores semánticos en español, no-spam garantizado en recordatorios |
 | R4 | El pairing con Hermes (gateway per-sender, canales, skills) cambia con el runtime | Media | Alto | Smokes de canal por fase; versiones verificadas documentadas; seguimiento del contrato de gateway del proyecto de referencia |
 | R5 | El build de Astro en el pipeline de release rompe el binario único | Baja | Medio | CI compila web → embed → build Go desde F4; smoke del release con panel servido |
-| R6 | Staff remoto sin acceso SSH no llega al panel | Media | Medio | Recetas opt-in documentadas (Caddy+HTTPS / Tailscale) elegibles por el dueño; asunción explícita registrada en §3.3 |
+| R6 | Staff remoto sin acceso SSH no llega al panel | Media | Medio | Recetas opt-in documentadas (**Tailcat recomendada para staff sin SSH** / Caddy+HTTPS / Tailscale) elegibles por el dueño; asunción explícita registrada en §3.3 |
 | R7 | Uso por encima del techo micro (pyme) con expectativas de performance | Baja | Medio | Techo validado en CI y declarado en la documentación; índices y paginación revisadas al cruzar el techo |
 
 ### 8.2 Dependencias
@@ -919,8 +925,9 @@ conversacional.
   on-enter/on-exit, deadlines, round-robin, rol por transición) sin scripting libre.
 - **Bot interno único**: el único bot de Telegram del equipo, con resolución per-emisor por
   `request_contact` + teléfono.
-- **Recetas opt-in de acceso**: túnel SSH / Caddy+HTTPS / Tailscale documentadas para
-  acceder al panel desde afuera; el binario es siempre loopback.
+- **Recetas opt-in de acceso**: túnel SSH (por defecto) / **Tailcat** (recomendada para
+  staff sin SSH — `github.com/tailscale/tailcat`) / Caddy+HTTPS / Tailscale documentadas
+  para acceder al panel desde afuera; el binario es siempre loopback.
 - **Techo validado**: volumen sintético (10k clientes / 100k tickets) probado en CI que
   declara hasta dónde el diseño está verificado.
 - **Loopback invariant**: el MCP solo escucha `127.0.0.1:3001` y el panel solo
@@ -958,3 +965,4 @@ conversacional.
 | 2026-11-26 | 1.9 | Kike (con el Gentleman) | Datos de contacto del negocio (revisión post-aprobación, T6): `business_profile` gana `phone` (llamadas, distinto del messenger_id), `email`, `website_url` (web institucional, distinta de `online_store_url`) y `social_links` (red→URL); Hermes los comparte con conducción (RF23). |
 | 2026-11-26 | 1.10 | Kike (con el Gentleman) | Canal e-mail definido (revisión post-aprobación, T7a/T7b): flujo canal-agnóstico (caller-id = correo del sender); cadencia casi inmediata (poll ~5 min configurable — el e-mail se comporta como chat lento); adjuntos out of scope v1 (evolución condicionada a multimodalidad de Hermes); pairing del canal e-mail sin verificación previa → verificar en F1 con el bridge real. |
 | 2026-11-26 | 1.11 | Kike (con el Gentleman) | Conocimiento de catálogo orientado al agente (pre-T4, para que el schema nazca con los campos): `catalog_items` gana `use_cases` (qué problemas resuelve — alimenta el [RESULTADO] de RF23 y el FTS) y `limitations` (qué NO cubre — honestidad pre-venta, menos reclamos); RF4 aclara que el FTS indexa description+use_cases+limitations y anota el `get_catalog_item` opcional de detalle para T7. |
+| 2026-11-27 | 1.12 | Kike (con el Gentleman) | Acceso remoto al panel: Tailcat (`github.com/tailscale/tailcat` — túneles WireGuard userspace de Tailscale, sin cuentas, root ni puertos entrantes) agregada como receta opt-in **recomendada para staff sin SSH** (§3.2, §3.3, RF21, F6, R6, §9.1); la dirección es bearer capability → la receta obliga `--allow` de claves de cliente y canal privado; evolución futura documentada: embeber la librería Go como modo de túnel del panel, condicionada al vencimiento de la asunción §3.3. |
