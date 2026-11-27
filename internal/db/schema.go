@@ -1,5 +1,11 @@
 package db
 
+import (
+	"fmt"
+
+	"github.com/egkike/crm-ai-business/internal/domain"
+)
+
 // This file is the canonical schema of the product: the only place where DDL
 // exists (AGENTS.md boundary contract 3). Everything here is append-only —
 // a later phase adds a NEW numbered migration and never edits a step that
@@ -23,6 +29,52 @@ const (
 	// workflow engine (F2 owns ticket_states/ticket_transitions), so the
 	// initial state is this column default.
 	TicketStateInitial = "nuevo"
+
+	// TicketTypeVentaID is the internal UUID of the F2 'venta' ticket type
+	// (PRD §3.7: "'venta': nuevo → contactado → presupuestado →
+	// cerrado/perdido, área Ventas con round-robin"). Like the F1 type, it is a
+	// fixed synthetic UUID so a row reference stays valid across backups and
+	// restores.
+	TicketTypeVentaID = "00000000-0000-4000-8000-000000000002"
+
+	// TicketTypeVentaName is the name of the F2 'venta' ticket type.
+	TicketTypeVentaName = "venta"
+
+	// AreaVentasID is the internal UUID of the seeded 'Ventas' area (RF7), the
+	// area the 'venta' ticket type declares as its default. Fixed for the same
+	// reason the seeded types are.
+	AreaVentasID = "00000000-0000-4000-8000-000000000101"
+
+	// AreaVentasName is the name of the seeded area.
+	AreaVentasName = "Ventas"
+)
+
+// The F1 state vocabulary and its mapped F2 vocabulary, as used by the
+// conversion of the existing 'consulta' tickets in migration 5.
+//
+// F1 had no workflow engine: `tickets.state` was free text carrying one of three
+// values (dto.TicketState*), and the DDL never constrained them. F2 turns states
+// into rows per type, so every stored value must name a declared state of its
+// type's config. The 'consulta' template of PRD §3.7 ("'consulta': nuevo →
+// atendido → resuelto") keeps two of the three F1 names and renames the
+// terminal one, and that is the only data change the conversion needs:
+//
+//	nuevo    → nuevo     (same name, no row to touch)
+//	atendido → atendido  (same name, no row to touch)
+//	cerrado  → resuelto  (the terminal state of the template; one UPDATE)
+//
+// 'resuelto' is the template's terminal state and 'cerrado' was F1's, so the
+// mapped ticket keeps its meaning: the conversation ended. Nothing else in the
+// product keys on the old value — the note guard travels the closed state as a
+// parameter (dto.TicketNoteAppend.ClosedState), and T3 replaces that fixed
+// vocabulary with the configured one.
+const (
+	// f1StateClosed is the F1 terminal state, the only F1 value with no
+	// same-name state in the 'consulta' template.
+	f1StateClosed = "cerrado"
+
+	// consultaStateResolved is the terminal state of the 'consulta' template.
+	consultaStateResolved = "resuelto"
 )
 
 // migration is one numbered, append-only step. Its DDL (statements) and its
@@ -123,6 +175,38 @@ var migrations = []migration{
 		statements: []string{
 			ddlTicketsActivityIndex,
 		},
+	},
+	{
+		// Migration 5: the configurable workflow of F2 (PRD §3.7, RF6/RF7) and the
+		// alert queue (RF11).
+		//
+		// Additive only, in the order the foreign keys demand: the areas exist
+		// before anything references them, the config tables accompany the columns
+		// the F1 DDL reserved for them (ticket_types.default_area_id,
+		// tickets.area_id/deadline_at/closed_at), and the alert queue arrives with
+		// the scheduler skeleton of T6.
+		//
+		// The seeds are generated from the domain templates (domain.VentaTemplate,
+		// domain.ConsultaTemplate) instead of restating the pipelines here: the seed
+		// and the engine that executes the config are then the same data, so a
+		// template edit cannot leave a shipped database behind. The 'consulta' type
+		// already exists (migration 2) and is CONVERTED, not re-created; see
+		// f1StateClosed for the state mapping of its existing tickets.
+		version: 5,
+		statements: []string{
+			ddlAreas,
+			ddlAreasAccounts,
+			ddlTicketTypesDefaultArea,
+			ddlTicketTypesInitialState,
+			ddlTicketStates,
+			ddlTicketTransitions,
+			ddlAlerts,
+			ddlAlertsPendingIndex,
+			ddlTicketsAreaID,
+			ddlTicketsDeadlineAt,
+			ddlTicketsClosedAt,
+		},
+		seeds: workflowSeedStatements(),
 	},
 }
 
@@ -347,13 +431,12 @@ CREATE TRIGGER catalog_items_fts_ad AFTER DELETE ON catalog_items BEGIN
     VALUES ('delete', old.rowid, old.name, old.description, old.use_cases, old.limitations);
 END`
 
-// ddlTicketTypes is the ticket-type catalogue. F1 has exactly one seeded type
-// (the seed migration below); F2 turns this into the configurable workflow
-// catalogue and adds the 'venta' template.
+// ddlTicketTypes is the ticket-type catalogue. F1 seeds exactly one type (the
+// seed migration below); F2 turns this into the configurable workflow catalogue
+// and adds the 'venta' template.
 //
-// Deferred columns, and why:
-//   - default_area_id — F2: areas do not exist yet. The column and its FK land
-//     with the areas migration, not by editing this step.
+// Columns added later (never by editing this step): default_area_id and
+// initial_state, both in migration 5 (F2).
 const ddlTicketTypes = `
 CREATE TABLE ticket_types (
     id         TEXT PRIMARY KEY NOT NULL CHECK (length(id) = 36),
@@ -376,10 +459,13 @@ CREATE TABLE ticket_types (
 // nullable (unassigned pool of RF5) and clears if the account row is removed —
 // the ticket survives its assignee.
 //
-// Deferred columns, and why:
-//   - area_id — F2 (areas).
-//   - deadline_at / computed deadlines — F2 (the scheduler computes them).
-//   - closed_at — F2, once a state can be terminal by configuration.
+// Deferred columns, and why (all three arrived in migration 5, F2):
+//   - area_id — the configurable area of the ticket, nullable and cleared when
+//     the area is deleted.
+//   - deadline_at — the computed deadline of the current state (the scheduler
+//     compares one stored instant instead of joining the config per ticket).
+//   - closed_at — when the ticket reached a terminal state, which F1 could not
+//     know because the vocabulary was fixed.
 const ddlTickets = `
 CREATE TABLE tickets (
     id             TEXT PRIMARY KEY NOT NULL CHECK (length(id) = 36),
@@ -453,3 +539,395 @@ CREATE INDEX ticket_events_ticket_idx ON ticket_events (ticket_id, id)`
 // migration.seeds, so this constant is a plain placeholder statement.
 const seedTicketTypeConsulta = `
 INSERT INTO ticket_types (id, name) VALUES (?, ?)`
+
+// --- F2: the configurable workflow (migration 5) ---------------------------
+//
+// The five tables of PRD §3.7 that turn the fixed F1 pipeline into configuration:
+// areas (RF7), ticket_states and ticket_transitions (RF6) and the alert queue
+// (RF11), plus the four columns F1's DDL reserved for them.
+//
+// The delete semantics are the §3.7 invariant, not a convenience: an area is
+// referenced by links (areas_accounts) and by optional pointers
+// (ticket_types.default_area_id, tickets.area_id), so removing an area removes
+// its membership rows and clears the pointers — no ticket and no workflow is
+// deleted because an area disappeared. The workflow rows (states, transitions)
+// belong to their type and die with it: a type without states cannot be operated,
+// so keeping orphan states would be a config that fails validation on every read.
+
+// ddlAreas is the RF7 area catalogue: "Áreas de atención configurables —
+// nombre, staff miembros (N:M con `accounts`)".
+//
+// name is UNIQUE because the Owner names areas in conversation ("pasá el ticket
+// al área de Soporte") and two areas with one name make that instruction
+// ambiguous — the resolver would have to guess, which the product never does.
+// The 1..50 bound is length() over the TEXT, which for SQLite counts characters
+// and not bytes, so it is the same bound domain.MaxWorkflowNameLen expresses in
+// runes.
+const ddlAreas = `
+CREATE TABLE areas (
+    id         TEXT PRIMARY KEY NOT NULL CHECK (length(id) = 36),
+    name       TEXT NOT NULL UNIQUE CHECK (length(name) BETWEEN 1 AND 50),
+    created_at TEXT NOT NULL DEFAULT (` + timestampDefault + `),
+    updated_at TEXT NOT NULL DEFAULT (` + timestampDefault + `)
+)`
+
+// ddlAreasAccounts is the N:M membership of RF7 (staff belongs to many areas;
+// an area has many staff). The composite primary key IS the set: a duplicate
+// assignment cannot be stored, so the "assign" operation is idempotent without a
+// read-then-write race.
+//
+// Both sides cascade: the link is meaningless once either endpoint is gone, and
+// it is the only row whose whole content is the pair.
+const ddlAreasAccounts = `
+CREATE TABLE areas_accounts (
+    area_id    TEXT NOT NULL REFERENCES areas (id) ON DELETE CASCADE,
+    account_id TEXT NOT NULL REFERENCES accounts (id) ON DELETE CASCADE,
+    PRIMARY KEY (area_id, account_id)
+)`
+
+// ddlTicketTypesDefaultArea adds the column F1 deferred to F2 (RF7: "cada tipo de
+// ticket declara su área por defecto"). It is nullable because the 'consulta'
+// template ships "sin área fija": every area is a queue someone must watch, and
+// spreading general consultations over all of them is the documented seed
+// behaviour, not a missing value.
+//
+// ON DELETE SET NULL: deleting an area must not delete the workflow of the type
+// that pointed at it — the type simply has no fixed area again.
+const ddlTicketTypesDefaultArea = `
+ALTER TABLE ticket_types ADD COLUMN default_area_id TEXT REFERENCES areas (id) ON DELETE SET NULL`
+
+// ddlTicketTypesInitialState adds the state a new ticket of the type is born in
+// (RF5: "queda en el estado inicial del tipo").
+//
+// The §3.7 canon rows of ticket_types and ticket_states do not name this column,
+// but the workflow entity does: `domain.WorkflowConfig.InitialState` must name a
+// declared state, and a config read back from the file has to answer "where does a
+// new ticket start?" without inferring it from the transition graph (a type may
+// have several roots, and "the one with no incoming transition" is a convention
+// nobody configured). It lives on the type, next to the default area, because it is
+// a declaration OF THE TYPE — the very phrasing RF5 uses.
+//
+// Nullable: a type whose config was never saved has no initial state, and a NULL
+// reads back as an empty InitialState, which Validate rejects (fail-closed) instead
+// of silently starting tickets in a guessed state.
+const ddlTicketTypesInitialState = `
+ALTER TABLE ticket_types ADD COLUMN initial_state TEXT`
+
+// ddlTicketStates is one state of a ticket type's pipeline (RF6: "Estados por
+// tipo — nombre, `deadline_hours` opcional, reglas on-enter/on-exit
+// declarativas").
+//
+//   - position is the declaration order of the state inside the workflow. The
+//     domain carries States as an ordered slice and the seed templates are
+//     ordered pipelines, so the row needs an explicit order column: relying on
+//     rowid would make "the order the Owner declared" an implicit property of the
+//     insertion history.
+//   - deadline_hours is nullable (a state may have no deadline) and CHECKed as
+//     NULL or >= 1, the inclusive lower bound of domain.Validate. The upper bound
+//     (one year) is deliberately NOT duplicated here: it is
+//     domain.MaxDeadlineHours, a rule with a Spanish rejection message, and a
+//     second numeric copy in the DDL would drift silently the day the cap moves.
+//   - on_enter_alert / on_exit_alert are the declarative notification rules as
+//     integer flags: the engine turns them into pending alerts, it never sends
+//     messages (RF11).
+//   - UNIQUE (ticket_type_id, name) is the identity the Owner uses: transitions
+//     name states by their name inside their type, so two states of one type
+//     cannot share it.
+const ddlTicketStates = `
+CREATE TABLE ticket_states (
+    id             TEXT PRIMARY KEY NOT NULL CHECK (length(id) = 36),
+    ticket_type_id TEXT NOT NULL REFERENCES ticket_types (id) ON DELETE CASCADE,
+    name           TEXT NOT NULL CHECK (length(name) BETWEEN 1 AND 50),
+    position       INTEGER NOT NULL DEFAULT 0 CHECK (position >= 0),
+    deadline_hours INTEGER CHECK (deadline_hours IS NULL OR deadline_hours >= 1),
+    on_enter_alert INTEGER NOT NULL DEFAULT 0 CHECK (on_enter_alert IN (0, 1)),
+    on_exit_alert  INTEGER NOT NULL DEFAULT 0 CHECK (on_exit_alert IN (0, 1)),
+    UNIQUE (ticket_type_id, name)
+)`
+
+// ddlTicketTransitions is one valid state change (RF6: "Transiciones válidas —
+// estado origen → destino, rol autorizado, auto-assign round-robin opcional").
+//
+// from_state and to_state carry STATE NAMES, not foreign keys to ticket_states.id:
+// the workflow is validated as a whole (WorkflowConfig.Validate rejects an origin
+// or destination that is not declared), and a composite foreign key here would
+// turn renaming a state into an implicit cascade decision the Owner never made.
+// The pair is unique per type, which is what makes "the transition from A to B"
+// a single answer, and from_state <> to_state rejects a self-loop at the file
+// level because a self-loop is never a transition (Validate rejects it too).
+//
+// min_role mirrors domain.TransitionRole exactly (staff/admin/owner, ascending).
+// 'client' is absent on purpose: a client never executes a transition (RF6
+// criterion: a client attempt is rejected FORBIDDEN).
+const ddlTicketTransitions = `
+CREATE TABLE ticket_transitions (
+    id             TEXT PRIMARY KEY NOT NULL CHECK (length(id) = 36),
+    ticket_type_id TEXT NOT NULL REFERENCES ticket_types (id) ON DELETE CASCADE,
+    from_state     TEXT NOT NULL,
+    to_state       TEXT NOT NULL,
+    position       INTEGER NOT NULL DEFAULT 0 CHECK (position >= 0),
+    min_role       TEXT NOT NULL CHECK (min_role IN ('staff','admin','owner')),
+    round_robin    INTEGER NOT NULL DEFAULT 0 CHECK (round_robin IN (0, 1)),
+    UNIQUE (ticket_type_id, from_state, to_state),
+    CHECK (from_state <> to_state)
+)`
+
+// ddlAlerts is the pending-alert queue of RF11: "scheduler in-process ... inserta
+// alertas pendientes ... Hermes las recoge con `get_pending_alerts` y las marca
+// con `mark_alert_as_sent`. El backend jamás envía mensajes por sí mismo".
+//
+//   - kind is the closed PRD vocabulary of §3.7. Unlike ticket_events.kind it IS
+//     CHECKed: the kinds are a product-level taxonomy (the panel groups them, the
+//     PRD lists them) that does not grow with user configuration, so a new kind is
+//     a product change and deserves the migration.
+//   - client_id / account_id / area_id are the possible targets (§3.7: "target
+//     (cliente o account)"; RF6 adds the area: "se genera una alerta `overdue`
+//     pendiente para el área asignada"). At least one must be present — an alert
+//     nobody can be told about could never be delivered and would sit in the
+//     queue forever. All cascade: deleting the target row removes the alerts
+//     about it, because an alert is a message TO someone about themselves.
+//     (area_id is born with migration 5 instead of waiting for the scheduler:
+//     relaxing a CHECK later means rebuilding the table in SQLite — a
+//     preventive additive column is the cheap path.)
+//   - state is 'pending' until Hermes reports delivery; sent_at records when.
+//     "Se entrega una vez" is the pair (state, sent_at), not a delete: RF11 keeps
+//     the trace of what was notified.
+//   - payload is a JSON object (possibly '{}') carrying what the message needs
+//     (ticket id, area name, masked identifier...), json_valid like every other
+//     JSON column of the schema.
+const ddlAlerts = `
+CREATE TABLE alerts (
+    id         TEXT PRIMARY KEY NOT NULL CHECK (length(id) = 36),
+    kind       TEXT NOT NULL CHECK (kind IN ('overdue','on-enter','on-exit','inactividad','nuevo-ticket','posible-duplicado','seguimiento-lead')),
+    client_id  TEXT REFERENCES clients (id) ON DELETE CASCADE,
+    account_id TEXT REFERENCES accounts (id) ON DELETE CASCADE,
+    area_id    TEXT REFERENCES areas (id) ON DELETE CASCADE,
+    state      TEXT NOT NULL DEFAULT 'pending' CHECK (state IN ('pending','sent')),
+    payload    TEXT NOT NULL DEFAULT '{}' CHECK (json_valid(payload)),
+    created_at TEXT NOT NULL DEFAULT (` + timestampDefault + `),
+    sent_at    TEXT,
+    CHECK (client_id IS NOT NULL OR account_id IS NOT NULL OR area_id IS NOT NULL)
+)`
+
+// ddlAlertsPendingIndex serves the one read the queue exists for: "give me the
+// pending alerts, oldest first" (RF11 criterion: alerts accumulated while Hermes
+// was down arrive in order, without duplicates). Without it that read is a scan
+// of every alert ever sent.
+const ddlAlertsPendingIndex = `
+CREATE INDEX alerts_pending_idx ON alerts (state, created_at, id)`
+
+// ddlTicketsAreaID adds the area of a ticket (PRD §3.7: "`tickets`: Instancia de
+// contacto — tipo, cliente, estado actual, área, asignado, deadlines
+// computadas").
+//
+// Nullable: a ticket whose type declares no default area starts with no area, and
+// the area can be assigned later. ON DELETE SET NULL for the same reason as the
+// type's default: removing an area must never remove tickets.
+const ddlTicketsAreaID = `
+ALTER TABLE tickets ADD COLUMN area_id TEXT REFERENCES areas (id) ON DELETE SET NULL`
+
+// ddlTicketsDeadlineAt is the computed deadline of the ticket in its current
+// state (RF6: "`deadline` por estado con aviso overdue"). It is written when the
+// state changes — computed from the state's deadline_hours — so the scheduler
+// compares one stored instant instead of a join per ticket, and NULL means "the
+// current state has no deadline".
+const ddlTicketsDeadlineAt = `
+ALTER TABLE tickets ADD COLUMN deadline_at TEXT`
+
+// ddlTicketsClosedAt is when the ticket reached a terminal state. F1 could not
+// have it (the vocabulary was fixed and `state` was the only signal); F2 marks
+// terminality by configuration, so the instant has to be stored. NULL means the
+// conversation is still open — the F1 rows keep it NULL until they move.
+const ddlTicketsClosedAt = `
+ALTER TABLE tickets ADD COLUMN closed_at TEXT`
+
+// The data statements of migration 5. Every value travels as a bound argument in
+// workflowSeedStatements (R2-004): no product data is ever pasted into SQL text.
+const (
+	seedAreaVentas = `
+INSERT INTO areas (id, name) VALUES (?, ?)`
+
+	seedTicketType = `
+INSERT INTO ticket_types (id, name, default_area_id, initial_state) VALUES (?, ?, ?, ?)`
+
+	// seedTicketTypeInitialState completes a type that already exists (the F1
+	// 'consulta', created by migration 2 before the column existed).
+	seedTicketTypeInitialState = `
+UPDATE ticket_types SET initial_state = ? WHERE id = ?`
+
+	seedTicketState = `
+INSERT INTO ticket_states (id, ticket_type_id, name, position, deadline_hours, on_enter_alert, on_exit_alert)
+VALUES (?, ?, ?, ?, ?, ?, ?)`
+
+	seedTicketTransition = `
+INSERT INTO ticket_transitions (id, ticket_type_id, from_state, to_state, position, min_role, round_robin)
+VALUES (?, ?, ?, ?, ?, ?, ?)`
+
+	// convertConsultaTicketState rewrites the single F1 state whose name the
+	// 'consulta' template does not carry (see f1StateClosed).
+	convertConsultaTicketState = `
+UPDATE tickets SET state = ? WHERE ticket_type_id = ? AND state = ?`
+)
+
+// seededStateKind and seededTransitionKind namespace the fixed identifiers of the
+// seeded configuration rows, so a state and a transition can never collide on an
+// id while each keeps a readable name.
+const (
+	seededStateKind      = 1
+	seededTransitionKind = 2
+)
+
+// seededConfigID builds the fixed id of the index-th seeded row of one kind.
+//
+// Fixed and deterministic on purpose: two databases seeded by the same binary hold
+// byte-identical configuration rows, so a backup diff shows data changes and not
+// id churn, and the ids stay valid across restore — the same property the F1 seed
+// gets from TicketTypeConsultaID.
+func seededConfigID(kind, index int) string {
+	return fmt.Sprintf("00000000-0000-4000-8%03d-%012d", kind, index)
+}
+
+// ticketTypeSeed is one seeded template: the ticket type row it creates (if the
+// step creates it at all) and the workflow taken from the domain.
+type ticketTypeSeed struct {
+	// typeID is the internal UUID of the ticket type.
+	typeID string
+
+	// config is the domain template: the single source of the states and
+	// transitions this step writes.
+	config domain.WorkflowConfig
+
+	// defaultArea is the area the type declares by default, or "" for
+	// "sin área fija" (stored as NULL).
+	defaultArea string
+
+	// createType tells the seed generator whether the type row itself has to be
+	// inserted. The 'consulta' type arrives from migration 2 and is converted, so
+	// its row already exists.
+	createType bool
+}
+
+// seededWorkflowTemplates are the seed templates of PRD §3.7, built from the
+// domain so the pipeline the product ships and the pipeline the engine executes
+// are the same declaration.
+//
+// 'venta' links to the 'Ventas' area this migration creates (the domain template
+// ships DefaultAreaID empty on purpose: the domain never knows row ids, the
+// seeding migration owns the link). 'consulta' ships "sin área fija", which is
+// the NULL default_area_id its existing row already carries.
+var seededWorkflowTemplates = []ticketTypeSeed{
+	{
+		typeID:     TicketTypeConsultaID,
+		config:     domain.ConsultaTemplate(),
+		createType: false,
+	},
+	{
+		typeID:      TicketTypeVentaID,
+		config:      domain.VentaTemplate(),
+		defaultArea: AreaVentasID,
+		createType:  true,
+	},
+}
+
+// workflowSeedStatements generates the data statements of migration 5 in
+// dependency order: the area, the ticket type that points at it, then every
+// state and transition of every seeded template, and last the conversion of the
+// F1 'consulta' tickets.
+//
+// Generating the INSERTs from the templates instead of hand-writing one statement
+// per row keeps the seed and the engine on one declaration. The generated text
+// carries table and column names only — every value is a bound argument, and
+// placeholder arity is derived from the argument list itself, so the structural
+// check of validateSeeds holds by construction.
+func workflowSeedStatements() []seedStatement {
+	seeds := []seedStatement{
+		{sql: seedAreaVentas, args: []any{AreaVentasID, AreaVentasName}},
+	}
+
+	stateIndex, transitionIndex := 0, 0
+	for _, template := range seededWorkflowTemplates {
+		if template.createType {
+			seeds = append(seeds, seedStatement{
+				sql: seedTicketType,
+				args: []any{
+					template.typeID,
+					template.config.TypeName,
+					nullableText(template.defaultArea),
+					nullableText(template.config.InitialState),
+				},
+			})
+		} else {
+			// The type row predates this step: only its initial state is missing.
+			seeds = append(seeds, seedStatement{
+				sql:  seedTicketTypeInitialState,
+				args: []any{nullableText(template.config.InitialState), template.typeID},
+			})
+		}
+
+		for position, state := range template.config.States {
+			seeds = append(seeds, seedStatement{
+				sql: seedTicketState,
+				args: []any{
+					seededConfigID(seededStateKind, stateIndex),
+					template.typeID,
+					state.Name,
+					position,
+					optionalHours(state.DeadlineHours),
+					flagInt(state.OnEnterAlert),
+					flagInt(state.OnExitAlert),
+				},
+			})
+			stateIndex++
+		}
+
+		for position, transition := range template.config.Transitions {
+			seeds = append(seeds, seedStatement{
+				sql: seedTicketTransition,
+				args: []any{
+					seededConfigID(seededTransitionKind, transitionIndex),
+					template.typeID,
+					transition.From,
+					transition.To,
+					position,
+					string(transition.MinRole),
+					flagInt(transition.RoundRobin),
+				},
+			})
+			transitionIndex++
+		}
+	}
+
+	seeds = append(seeds, seedStatement{
+		sql:  convertConsultaTicketState,
+		args: []any{consultaStateResolved, TicketTypeConsultaID, f1StateClosed},
+	})
+	return seeds
+}
+
+// nullableText maps the empty string of a carrier to SQL NULL. The two mean
+// different things in the schema (” would be an area named nothing, NULL is "no
+// area"), and the DDL default is NULL.
+func nullableText(value string) any {
+	if value == "" {
+		return nil
+	}
+	return value
+}
+
+// optionalHours maps an optional deadline to the column: a state without a
+// deadline stores NULL, not 0 (0 is rejected by the CHECK and would read as
+// "expires immediately").
+func optionalHours(deadline *int) any {
+	if deadline == nil {
+		return nil
+	}
+	return *deadline
+}
+
+// flagInt maps a declarative rule flag to the integer the DDL stores.
+func flagInt(flag bool) any {
+	if flag {
+		return 1
+	}
+	return 0
+}
