@@ -188,3 +188,15 @@ Routes refined with the explorer code map (2026-11-27, evidence path:line):
   to template terminal 'resuelto' (S9/§3.7 pipeline), test migrates a real v4 DB.
   Rider R2-001 NOT landed (out of the worker's scope, stays backlog). AreaStore has
   no delete method by design (RF7 'elimina' is the double-gated destructive → T4).
+- **L9** (2026-11-27, evidence): T2 RDD closed. Native assess (baseRef
+  867925651604f8b16d2382b15a547d8d1a963ebb): risk **high**, `reviewDue: true` (agent
+  escalation item 1 — migration rewrites stored state; executable_change doc.go).
+  Native review **review-facf75c0a9cacc06** ran 3 lenses (risk/reliability/resilience) →
+  **approved**, receipt burned. One transport incident: the resilience reviewer's first
+  result was refused at admission (unknown field "evidence"); the slot re-ran cleanly
+  via lineage resume — never the refused bytes. 4 advisory findings (all informational)
+  → backlog: R3-001 **T3 rider (important: post-v5 'cerrado' writes until the engine
+  replaces the vocabulary)**, R3-002 next-touch, R4-001 T4 rider (save must reject
+  dropping in-use states), R4-002 no-action. Independent verifier (gentle-ai-verify,
+  Risk: item 1): 7/7 claims CONFIRMED, **S9: covered**, one cosmetic note on rider
+  label cross-references.
