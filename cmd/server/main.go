@@ -155,7 +155,21 @@ func buildMCPHandler() (http.Handler, error) {
 	if err != nil {
 		return nil, err
 	}
-	createTicket, err := usecase.NewCreateTicket(ticketsRepo, clients)
+
+	// The workflow engine (F2 T3): the configured pipeline of the ticket's type
+	// plus the round-robin queue of its area. Both are fail-closed adapters, and
+	// the use cases refuse to be built without them — the engine has no fixed
+	// vocabulary to fall back to.
+	workflows, err := repository.NewWorkflowConfigRepo(handle)
+	if err != nil {
+		return nil, err
+	}
+	rotation, err := repository.NewRoundRobinRepo(handle)
+	if err != nil {
+		return nil, err
+	}
+
+	createTicket, err := usecase.NewCreateTicket(ticketsRepo, clients, workflows)
 	if err != nil {
 		return nil, err
 	}
@@ -167,11 +181,11 @@ func buildMCPHandler() (http.Handler, error) {
 	if err != nil {
 		return nil, err
 	}
-	addTicketNote, err := usecase.NewAddTicketNote(ticketsRepo)
+	addTicketNote, err := usecase.NewAddTicketNote(ticketsRepo, workflows)
 	if err != nil {
 		return nil, err
 	}
-	transitionTicket, err := usecase.NewTransitionTicket(ticketsRepo)
+	transitionTicket, err := usecase.NewTransitionTicket(ticketsRepo, workflows, rotation)
 	if err != nil {
 		return nil, err
 	}

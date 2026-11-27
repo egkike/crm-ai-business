@@ -55,6 +55,7 @@ const (
 // a rename cannot desynchronize them.
 const (
 	argMotive        = "motive"
+	argTicketType    = "ticket_type"
 	argClientID      = "client_id"
 	argTicketID      = "ticket_id"
 	argText          = "text"
@@ -83,6 +84,11 @@ var (
       "type": "string",
       "maxLength": 120,
       "description": "Motivo de negocio del contacto, en las palabras de la persona (por ejemplo \"consulta por corte de pelo\" o \"me duele la espalda desde el lunes\"). Es obligatorio: un mensaje sin motivo de negocio no genera ticket."
+    },
+    "ticket_type": {
+      "type": "string",
+      "maxLength": 50,
+      "description": "Tipo de ticket configurado por el negocio (por ejemplo 'venta' o 'consulta'). Define el estado inicial, el área y los deadlines del ticket. Si se omite, se abre una consulta general."
     },
     "client_id": {
       "type": "string",
@@ -145,8 +151,7 @@ var (
     },
     "state": {
       "type": "string",
-      "enum": ["nuevo", "atendido", "cerrado"],
-      "description": "Estado destino del ticket."
+      "description": "Estado destino, con el nombre que el negocio configuró para el tipo del ticket (por ejemplo 'contactado' en 'venta' o 'atendido' en 'consulta'). La transición desde el estado actual debe estar declarada en la configuración del tipo y tu rol debe alcanzar el mínimo que esa transición exige; si no, la llamada se rechaza."
     }
   },
   "required": ["ticket_id", "state"],
@@ -169,10 +174,14 @@ var (
   "type": "object",
   "properties": {
     "id": {"type": "string", "description": "Identificador interno (UUID) del ticket."},
-    "ticket_type_id": {"type": "string", "description": "Tipo de ticket. En F1 siempre es la consulta."},
+    "ticket_type_id": {"type": "string", "description": "Identificador interno del tipo de ticket."},
+    "ticket_type": {"type": "string", "description": "Nombre del tipo de ticket configurado (por ejemplo 'venta' o 'consulta')."},
     "client_id": {"type": "string", "description": "Identificador interno (UUID) del cliente."},
-    "state": {"type": "string", "enum": ["nuevo", "atendido", "cerrado"], "description": "Estado actual del ticket."},
+    "state": {"type": "string", "description": "Estado actual del ticket, con el nombre que el negocio configuró para su tipo."},
     "assigned_to": {"type": "string", "description": "Identificador interno de quien tiene asignado el ticket, o vacío si está sin asignar."},
+    "area_id": {"type": "string", "description": "Identificador interno del área del ticket, o vacío si su tipo no declara un área por defecto."},
+    "deadline_at": {"type": "string", "description": "Fecha límite del estado actual en ISO-8601 UTC, o vacío si el estado no declara deadline."},
+    "closed_at": {"type": "string", "description": "Cuándo el ticket llegó a un estado final, en ISO-8601 UTC; vacío mientras la conversación siga abierta."},
     "created_at": {"type": "string", "description": "Cuándo se abrió, en ISO-8601 UTC."},
     "updated_at": {"type": "string", "description": "Cuándo fue la última actividad, en ISO-8601 UTC."},
     "events": {
@@ -181,7 +190,7 @@ var (
       "items": ` + string(ticketEventOutputSchema) + `
     }
   },
-  "required": ["id", "ticket_type_id", "client_id", "state", "assigned_to", "created_at", "updated_at", "events"]
+  "required": ["id", "ticket_type_id", "ticket_type", "client_id", "state", "assigned_to", "area_id", "deadline_at", "closed_at", "created_at", "updated_at", "events"]
 }`)
 
 	ticketListOutputSchema = json.RawMessage(`{
@@ -215,9 +224,13 @@ type ticketEventOutput struct {
 type ticketOutput struct {
 	ID           string              `json:"id"`
 	TicketTypeID string              `json:"ticket_type_id"`
+	TicketType   string              `json:"ticket_type"`
 	ClientID     string              `json:"client_id"`
 	State        string              `json:"state"`
 	AssignedTo   string              `json:"assigned_to"`
+	AreaID       string              `json:"area_id"`
+	DeadlineAt   string              `json:"deadline_at"`
+	ClosedAt     string              `json:"closed_at"`
 	CreatedAt    string              `json:"created_at"`
 	UpdatedAt    string              `json:"updated_at"`
 	Events       []ticketEventOutput `json:"events"`
@@ -256,9 +269,13 @@ func newTicketOutput(record dto.TicketRecord, events []dto.TicketEventRecord) ti
 	output := ticketOutput{
 		ID:           record.ID,
 		TicketTypeID: record.TicketTypeID,
+		TicketType:   record.TicketType,
 		ClientID:     record.ClientID,
 		State:        string(record.State),
 		AssignedTo:   record.AssignedTo,
+		AreaID:       record.AreaID,
+		DeadlineAt:   record.DeadlineAt,
+		ClosedAt:     record.ClosedAt,
 		CreatedAt:    record.CreatedAt,
 		UpdatedAt:    record.UpdatedAt,
 		Events:       make([]ticketEventOutput, 0, len(events)),
@@ -297,6 +314,8 @@ func createTicketTool(create TicketCreate) Tool {
 			Name: createTicketToolName,
 			Description: "Abre un ticket para el contacto en curso. Llamala cuando el mensaje tiene un motivo de negocio (consulta, reclamo, pedido), " +
 				"aunque la persona todavía no compre ni solicite nada: el contacto queda registrado en el historial. " +
+				"El tipo de ticket ('venta', 'consulta' u otro configurado por el negocio) decide en qué estado nace, a qué área va y su deadline; " +
+				"si no lo indicás, se abre una consulta general. " +
 				"Si la persona ya tiene un ticket ABIERTO de la misma consulta, no abras otro: agregá su mensaje con add_ticket_note.",
 			InputSchema:  createTicketInputSchema,
 			OutputSchema: ticketOutputSchema,
@@ -401,14 +420,16 @@ func listTicketsTool(list TicketListAll) Tool {
 //
 // Access: the three internal roles (RF9: "internos operan tickets"). A client
 // asking for a state change is refused by the registry and, independently, by the
-// use case.
+// use case; on top of the role gate, the transition enforces the per-transition
+// minimum role the Owner configured (RF6).
 func transitionTicketTool(transition TicketTransition) Tool {
 	return Tool{
 		Definition: &gomcp.Tool{
 			Name: transitionTicketToolName,
-			Description: "Cambia el estado de un ticket. Los estados son nuevo, atendido y cerrado. " +
+			Description: "Cambia el estado de un ticket al estado destino que el negocio configuró para ese tipo. " +
+				"La transición desde el estado actual debe estar declarada y tu rol debe alcanzar el mínimo que exige: si no, la llamada se rechaza. " +
 				"Cada transición queda auditada con quién la hizo, cuándo y desde/hacia qué estado. " +
-				"Un ticket cerrado no acepta más notas: si el cliente vuelve, se abre uno nuevo.",
+				"Un ticket en su estado final no acepta más notas: si el cliente vuelve, se abre uno nuevo.",
 			InputSchema:  transitionTicketInputSchema,
 			OutputSchema: ticketOutputSchema,
 		},
@@ -479,6 +500,16 @@ func decodeCreateTicketArgs(raw json.RawMessage, role auth.Role) (dto.CreateTick
 				return dto.CreateTicketCommand{}, err
 			}
 			command.Motive = motive
+		case argTicketType:
+			// The type is the engine's key (RF6): the use case loads its config,
+			// so a name nobody configured is a business rejection, never a
+			// transport guess. An absent or empty value opens the general
+			// consultation.
+			ticketType, err := decodeBoundedText(value, argTicketType, usecase.MaxTicketTypeNameLen)
+			if err != nil {
+				return dto.CreateTicketCommand{}, err
+			}
+			command.TicketType = ticketType
 		case argClientID:
 			if !role.IsInternal() {
 				return dto.CreateTicketCommand{}, invalidArguments(
@@ -570,6 +601,22 @@ func decodeAddTicketNoteArgs(raw json.RawMessage) (dto.TicketNote, error) {
 }
 
 // decodeTransitionTicketArgs validates the transition arguments.
+//
+// THE STATE IS DECODED AS A FREE STRING ON PURPOSE — rider R1-transition-state-
+// decode, resolved here by removing the requirement instead of enforcing it. F1
+// announced `"enum": ["nuevo","atendido","cerrado"]` because the vocabulary was
+// fixed; since F2 the states of a ticket are the ones its TYPE configures (RF5:
+// "estados/deadlines computan desde la config del tipo"), so a static enum at the
+// decoder is impossible by construction: the decoder cannot know the workflow of
+// the ticket a request names without loading it, and a decoder that loaded it
+// would duplicate the engine in the transport.
+//
+// The gate is therefore the USE CASE's refutation: it loads the type's config and
+// rejects an undeclared state, an undeclared transition and a transition the
+// caller's role may not execute, each with its own Spanish message and its own
+// data.code (invalid_ticket_state / role_not_allowed). The schema declares the
+// shape (a string) and the description tells the agent where the real vocabulary
+// lives; nothing is validated against a list here, and nothing pretends to be.
 func decodeTransitionTicketArgs(raw json.RawMessage) (dto.TransitionCommand, error) {
 	arguments, err := argumentObject(raw, transitionTicketToolName)
 	if err != nil {

@@ -3,6 +3,7 @@ package mcp_test
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net/http"
 	"sort"
@@ -13,6 +14,7 @@ import (
 	"github.com/egkike/crm-ai-business/internal/application/dto"
 	"github.com/egkike/crm-ai-business/internal/application/usecase"
 	"github.com/egkike/crm-ai-business/internal/auth"
+	"github.com/egkike/crm-ai-business/internal/domain"
 	"github.com/egkike/crm-ai-business/internal/mcp"
 )
 
@@ -32,6 +34,13 @@ const (
 	// demoCaller is the WhatsApp-style identity of the demo loop: unknown to the
 	// resolver until it registers.
 	demoCaller = "+5491100007777"
+
+	// staffAccountID is the internal UUID of the staff caller (newFakeResolver).
+	staffAccountID = "22222222-2222-4222-8222-222222222222"
+
+	// ventasAreaID is the internal UUID of the seeded 'Ventas' area, mirrored from
+	// internal/db like every other seeded identifier this package's fixtures use.
+	ventasAreaID = "00000000-0000-4000-8000-000000000101"
 )
 
 // fakeTicketStore is the TicketStore double behind the REAL ticket use cases: the
@@ -42,15 +51,32 @@ type fakeTicketStore struct {
 	mu      sync.Mutex
 	tickets map[string]dto.TicketRecord
 	events  map[string][]dto.TicketEventRecord
-	nextID  int64
-	clock   int
+	// workflows is the engine registry the use cases read, so this double answers
+	// "is this state terminal?" the way the real adapter derives it from the
+	// config rows.
+	workflows *fakeWorkflows
+	rotation  *fakeRotation
+	nextID    int64
+	clock     int
 }
 
 func newFakeTicketStore() *fakeTicketStore {
 	return &fakeTicketStore{
-		tickets: map[string]dto.TicketRecord{},
-		events:  map[string][]dto.TicketEventRecord{},
+		tickets:   map[string]dto.TicketRecord{},
+		events:    map[string][]dto.TicketEventRecord{},
+		workflows: newFakeWorkflows(domain.ConsultaTemplate(), ventaWorkflow()),
+		rotation:  &fakeRotation{members: []string{staffAccountID}},
 	}
+}
+
+// isClosed answers "is this ticket's conversation over?" from the configured
+// transitions of its type, like the repository guard does.
+func (f *fakeTicketStore) isClosed(ticket dto.TicketRecord) bool {
+	config, found := f.workflows.configs[ticket.TicketType]
+	if !found {
+		return true
+	}
+	return config.IsTerminal(string(ticket.State))
 }
 
 // stamp returns the next fake timestamp.
@@ -81,9 +107,12 @@ func (f *fakeTicketStore) CreateTicket(_ context.Context, ticket dto.NewTicket) 
 	stamp := f.stamp()
 	f.tickets[ticket.ID] = dto.TicketRecord{
 		ID:           ticket.ID,
-		TicketTypeID: ticket.TicketTypeID,
+		TicketTypeID: dto.ConsultaTicketTypeID,
+		TicketType:   ticket.TicketType,
 		ClientID:     ticket.ClientID,
 		State:        ticket.State,
+		AreaID:       ticket.AreaID,
+		DeadlineAt:   ticket.DeadlineAt,
 		CreatedAt:    stamp,
 		UpdatedAt:    stamp,
 	}
@@ -118,7 +147,7 @@ func (f *fakeTicketStore) page(clientID string, includeClosed bool, limit, offse
 		if clientID != "" && ticket.ClientID != clientID {
 			continue
 		}
-		if !includeClosed && ticket.State.Closed() {
+		if !includeClosed && f.isClosed(ticket) {
 			continue
 		}
 		matches = append(matches, ticket)
@@ -145,6 +174,13 @@ func (f *fakeTicketStore) TransitionTicket(_ context.Context, transition dto.Tic
 		return false, nil
 	}
 	current.State = transition.To
+	current.DeadlineAt = transition.DeadlineAt
+	if transition.Closes {
+		current.ClosedAt = f.stamp()
+	}
+	if transition.AssignTo != "" {
+		current.AssignedTo = transition.AssignTo
+	}
 	current.UpdatedAt = f.stamp()
 	f.tickets[transition.TicketID] = current
 	f.append(transition.TicketID, transition.Event.Actor, transition.Event.Kind, transition.Event.Payload)
@@ -159,7 +195,7 @@ func (f *fakeTicketStore) AddTicketNote(_ context.Context, note dto.TicketNoteAp
 	defer f.mu.Unlock()
 
 	current, ok := f.tickets[note.TicketID]
-	if !ok || current.State.Closed() {
+	if !ok || f.isClosed(current) {
 		return dto.TicketRecord{}, false, nil
 	}
 
@@ -173,6 +209,52 @@ func (f *fakeTicketStore) ListTicketEvents(_ context.Context, ticketID string) (
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	return append([]dto.TicketEventRecord(nil), f.events[ticketID]...), nil
+}
+
+// fakeWorkflows is the domain.WorkflowConfigStore double of this package: the
+// seeded templates plus whatever a test registers.
+type fakeWorkflows struct {
+	configs map[string]domain.WorkflowConfig
+}
+
+func newFakeWorkflows(configs ...domain.WorkflowConfig) *fakeWorkflows {
+	workflows := &fakeWorkflows{configs: map[string]domain.WorkflowConfig{}}
+	for _, config := range configs {
+		workflows.configs[config.TypeName] = config
+	}
+	return workflows
+}
+
+func (f *fakeWorkflows) LoadConfig(_ context.Context, typeName string) (domain.WorkflowConfig, bool, error) {
+	config, found := f.configs[typeName]
+	return config, found, nil
+}
+
+func (f *fakeWorkflows) SaveConfig(context.Context, domain.WorkflowConfig) (bool, error) {
+	return false, errors.New("fakeWorkflows: SaveConfig no está implementado")
+}
+
+// fakeRotation is the AreaRotator double: a deterministic ring of members.
+type fakeRotation struct {
+	members []string
+	next    int
+}
+
+func (f *fakeRotation) NextAreaAssignee(_ context.Context, _ string) (string, error) {
+	if len(f.members) == 0 {
+		return "", nil
+	}
+	member := f.members[f.next%len(f.members)]
+	f.next++
+	return member, nil
+}
+
+// ventaWorkflow is the 'venta' template linked to the seeded Ventas area (the
+// seeding migration owns the link).
+func ventaWorkflow() domain.WorkflowConfig {
+	config := domain.VentaTemplate()
+	config.DefaultAreaID = ventasAreaID
+	return config
 }
 
 // fakeTicketDirectory is the ClientDirectory double: it knows the client ids the
@@ -231,7 +313,7 @@ func newTicketsFixture(t *testing.T) *ticketsFixture {
 	store := newFakeTicketStore()
 	directory := newFakeTicketDirectory()
 
-	createTicket, err := usecase.NewCreateTicket(store, directory)
+	createTicket, err := usecase.NewCreateTicket(store, directory, store.workflows)
 	if err != nil {
 		t.Fatalf("NewCreateTicket() error inesperado: %v", err)
 	}
@@ -243,11 +325,11 @@ func newTicketsFixture(t *testing.T) *ticketsFixture {
 	if err != nil {
 		t.Fatalf("NewListTickets() error inesperado: %v", err)
 	}
-	addNote, err := usecase.NewAddTicketNote(store)
+	addNote, err := usecase.NewAddTicketNote(store, store.workflows)
 	if err != nil {
 		t.Fatalf("NewAddTicketNote() error inesperado: %v", err)
 	}
-	transition, err := usecase.NewTransitionTicket(store)
+	transition, err := usecase.NewTransitionTicket(store, store.workflows, store.rotation)
 	if err != nil {
 		t.Fatalf("NewTransitionTicket() error inesperado: %v", err)
 	}
@@ -275,9 +357,13 @@ func newTicketsFixture(t *testing.T) *ticketsFixture {
 type ticketWire struct {
 	ID           string `json:"id"`
 	TicketTypeID string `json:"ticket_type_id"`
+	TicketType   string `json:"ticket_type"`
 	ClientID     string `json:"client_id"`
 	State        string `json:"state"`
 	AssignedTo   string `json:"assigned_to"`
+	AreaID       string `json:"area_id"`
+	DeadlineAt   string `json:"deadline_at"`
+	ClosedAt     string `json:"closed_at"`
 	CreatedAt    string `json:"created_at"`
 	UpdatedAt    string `json:"updated_at"`
 	Events       []struct {
@@ -412,7 +498,7 @@ func TestInternalTicketToolsAreRefusedForClients(t *testing.T) {
 	for _, tool := range []string{listTicketsTool, transitionTicketTool} {
 		t.Run(tool, func(t *testing.T) {
 			response := callTool(t, fixture.handler, emailCaller, tool,
-				`{"ticket_id":"`+created.ID+`","state":"cerrado"}`)
+				`{"ticket_id":"`+created.ID+`","state":"atendido"}`)
 
 			if response.Error == nil {
 				t.Fatalf("se esperaba error JSON-RPC, result: %s", response.Result)
@@ -432,7 +518,7 @@ func TestInternalTicketToolsAreRefusedForClients(t *testing.T) {
 	if err != nil || !found {
 		t.Fatalf("GetTicket() = %t, %v", found, err)
 	}
-	if stored.State != dto.TicketStateInitial {
+	if stored.State != dto.TicketStateNew {
 		t.Fatalf("state = %q, la transición se ejecutó pese al rechazo", stored.State)
 	}
 	if events, _ := fixture.store.ListTicketEvents(context.Background(), created.ID); len(events) != 1 {
@@ -485,8 +571,8 @@ func TestTicketDemoValueLoopOverHTTP(t *testing.T) {
 	if created.ClientID != registeredClientID {
 		t.Fatalf("client_id = %q, se esperaba el del caller registrado", created.ClientID)
 	}
-	if created.State != string(dto.TicketStateInitial) {
-		t.Fatalf("state = %q, se esperaba %q", created.State, dto.TicketStateInitial)
+	if created.State != string(dto.TicketStateNew) {
+		t.Fatalf("state = %q, se esperaba %q", created.State, dto.TicketStateNew)
 	}
 	if len(created.Events) != 1 || created.Events[0].Kind != dto.TicketEventKindCreated {
 		t.Fatalf("eventos = %+v, se esperaba el evento de creación", created.Events)
@@ -750,7 +836,7 @@ func TestClientCannotReadAnotherClientsTickets(t *testing.T) {
 		ID:           "foreign-ticket",
 		TicketTypeID: dto.ConsultaTicketTypeID,
 		ClientID:     otherClient,
-		State:        dto.TicketStateInitial,
+		State:        dto.TicketStateNew,
 		CreatedAt:    "2026-08-01T09:00:00.000Z",
 		UpdatedAt:    "2026-08-01T09:00:00.000Z",
 	}
@@ -795,17 +881,27 @@ func TestTicketToolsRejectBadArguments(t *testing.T) {
 		assertSemanticWire(t, response, usecase.CodeInvalidTicket, "el texto de la nota es obligatorio.")
 	})
 
-	t.Run("estado fuera del vocabulario", func(t *testing.T) {
+	t.Run("estado fuera del workflow", func(t *testing.T) {
 		created := ticketCallResult(t, callTool(t, fixture.handler, emailCaller, createTicketTool, `{"motive":"consulta"}`))
 		response := callTool(t, fixture.handler, staffCaller, transitionTicketTool,
 			`{"ticket_id":"`+created.ID+`","state":"en-proceso"}`)
+		// The vocabulary is the configured one, so the rejection is the engine's
+		// (RF6), not a decoder enum's (rider R1-transition-state-decode).
 		assertSemanticWire(t, response, usecase.CodeInvalidTicketState,
-			"el estado destino no es válido: en F1 los estados posibles son nuevo, atendido y cerrado.")
+			"el estado 'en-proceso' no existe en el workflow del tipo 'consulta'.")
+	})
+
+	t.Run("transición no declarada", func(t *testing.T) {
+		created := ticketCallResult(t, callTool(t, fixture.handler, emailCaller, createTicketTool, `{"motive":"consulta"}`))
+		response := callTool(t, fixture.handler, staffCaller, transitionTicketTool,
+			`{"ticket_id":"`+created.ID+`","state":"resuelto"}`)
+		assertSemanticWire(t, response, usecase.CodeInvalidTicketState,
+			"no se puede pasar el ticket del estado 'nuevo' al 'resuelto': esa transición no está declarada en el workflow del tipo 'consulta'.")
 	})
 
 	t.Run("ticket inexistente", func(t *testing.T) {
 		response := callTool(t, fixture.handler, staffCaller, transitionTicketTool,
-			`{"ticket_id":"00000000-0000-4000-8000-0000000000ff","state":"cerrado"}`)
+			`{"ticket_id":"00000000-0000-4000-8000-0000000000ff","state":"atendido"}`)
 		assertSemanticWire(t, response, usecase.CodeTicketNotFound, "no existe un ticket con ese identificador.")
 	})
 
@@ -822,7 +918,7 @@ func TestTicketToolsRejectBadArguments(t *testing.T) {
 func TestTicketToolsRefusePartialWiring(t *testing.T) {
 	ports := newPorts()
 	store := newFakeTicketStore()
-	create, err := usecase.NewCreateTicket(store, newFakeTicketDirectory())
+	create, err := usecase.NewCreateTicket(store, newFakeTicketDirectory(), store.workflows)
 	if err != nil {
 		t.Fatalf("NewCreateTicket() error inesperado: %v", err)
 	}
