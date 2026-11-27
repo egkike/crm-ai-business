@@ -178,6 +178,30 @@ summary — the native lifecycle owns the mechanics; these rules bind the agent.
    or the native `capture-validation` CLI, never a fresh lineage.
 6. **A review outcome never authorizes delivery.** Push, PR and merge follow ordinary
    repository policy.
+7. **Every candidate closes with a receipt.** Whenever a review is not run — assess
+   `reviewDue: false` (including a doc delta the owner left passive), `unassessable`,
+   a consent decline, or any stop that leaves the candidate in place — the closure
+   procedure applies so no candidate stays open with a warning: `inspect` with the
+   committed-range selector (`baseRef` = the candidate's parent, full 40-char SHA,
+   `committedOnly: true`) → `START` without lenses (the native auto-selects for the
+   tier) → resume via `gentle_review_run` (`lineageId` + the returned base-ref) →
+   receipt burned. An owner disposition decides WHICH candidates get a full review;
+   it does not leave the record open. Apply the closure immediately — a docs edit
+   after the receipt spawns another delta and the cycle repeats.
+8. **A running verifier blocks the review.** When an independent verifier
+   (`gentle-ai-verify`, Risk: item N) applies, it runs FIRST and its verdict is waited
+   for before the native assess/review: findings are fixed or dispositioned, and only
+   the final diff goes to review. Never launch the review in parallel with an active
+   verifier — a fix under an open lineage creates a second candidate and a double
+   review run. (This does not mandate a verifier for every change; it only fixes the
+   order when one exists.)
+9. **Evidence folds into the reviewed work unit.** Doc commits (backlog riders, the
+   feature doc's Log) land inside the same commit/slice the review approves — never
+   after it — so the reviewed range covers them and no orphan delta is born. When a
+   candidate exceeds the reviewer lens context budget (observed at ~3.2k lines), the
+   native demands chained smaller candidates: review commit by commit, and for an
+   inner commit check it out detached (`git checkout --detach <sha>`) so the workspace
+   projection matches the reduced candidate.
 
 ## Branch & Commit Strategy
 
