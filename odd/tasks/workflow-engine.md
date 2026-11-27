@@ -104,7 +104,7 @@ Quotes are VERBATIM from docs/PRD.md v1.12 — the RF text is the spec; never pa
 |---|---|---|---|
 | T1 | S2, S9 | internal/domain birth: workflow config entities + `Validate` fail-closed + parity tests | 9117c9b (move) + 86cbf8a (workflow) |
 | T2 | S9 | migration v5: `areas`, `ticket_types`, `ticket_states`, `ticket_transitions`, `alerts` + seeds 'venta'/'consulta' + ports/adapters + riders R3-1/2/3 | 0c863f9 + dbc48c8 |
-| T3 | S1, S2 | engine: creation/transition/deadlines via config, round-robin, events audited, FORBIDDEN por rol | — |
+| T3 | S1, S2 | engine: creation/transition/deadlines via config, round-robin, events audited, FORBIDDEN por rol | 1d042e4 (core) + 0018ef9 (transport) |
 | T4 | S2, S3 | tools MCP de administración Owner: config de workflows por chat, doble gate destructivas, áreas CRUD | — |
 | T5 | S4 | visibilidad RF8 en listados MCP (staff: propios + no asignados de sus áreas) | — |
 | T6 | S6, S2 | scheduler in-process: overdue + on-enter/on-exit + nuevo-ticket → `alerts`; `get_pending_alerts`/`mark_alert_as_sent` | — |
@@ -200,3 +200,23 @@ Routes refined with the explorer code map (2026-11-27, evidence path:line):
   dropping in-use states), R4-002 no-action. Independent verifier (gentle-ai-verify,
   Risk: item 1): 7/7 claims CONFIRMED, **S9: covered**, one cosmetic note on rider
   label cross-references.
+- **L10** (2026-11-27, evidence): T3 RDD closed as CHAINED CANDIDATES — the full
+  range (19 paths, 3186 lines) exceeded the native lens context budget
+  (`lens_context_budget_exceeded`, lineage review-a6cad904505fa813 not started,
+  retry-safe); split per the native's own instruction: the transport commit
+  reviewed from the branch HEAD (review-fed0cbe89c459363, risk+reliability,
+  APPROVED) and the engine core reviewed from a DETACHED checkout of 1d042e4 —
+  the workspace projection compares the checked-out tree, so the smaller
+  candidate requires checking out the smaller commit (review-3541f9c38c60e2af,
+  risk+reliability, APPROVED). Both receipts burned. 7 advisory findings →
+  backlog: R3-ticket-type-default (T6 rider: rotation vs updated_at churn),
+  rotation-no-cursor (no action, documented contract), rotation-renamed (fold
+  into T6 clock-port), ticket-type-rule (test rider), R3-1/2/3 mcp test riders.
+  Worker decision points ACCEPTED by the parent: optional ticket_type wire arg
+  (default 'consulta', unknown fails closed — confirm before Hermes docs; T4's
+  type-discovery tool is the companion); listing median 90ms (122ms -race) at
+  the 100k ceiling vs 200ms budget, real lever documented in code; closed_at
+  NOT backfilled for converted rows → T6 must derive open/closed from config
+  transitions, never treat closed_at IS NULL as open for pre-F2 rows.
+  LESSON for T4+: candidates over ~2k changed lines will exceed the reviewer
+  budget — plan work-unit commits as reviewable candidates from the start.

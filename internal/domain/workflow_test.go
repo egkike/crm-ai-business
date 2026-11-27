@@ -398,3 +398,164 @@ func TestSeedTemplates(t *testing.T) {
 		}
 	})
 }
+
+// --- The engine rules (F2 T3) ----------------------------------------------
+//
+// These are the pure lookups the ticket use cases execute the configured
+// workflow with. They live in the domain so the application layer stays a thin
+// orchestration layer: "which state is this?", "is this pair a declared
+// transition?", "is this state terminal?", "may this role run it?".
+
+func TestWorkflowStateLookup(t *testing.T) {
+	cfg := ConsultaTemplate()
+
+	state, ok := cfg.State("atendido")
+	if !ok {
+		t.Fatal("State(atendido) no encontró un estado declarado")
+	}
+	if state.Name != "atendido" {
+		t.Fatalf("State(atendido).Name = %q", state.Name)
+	}
+
+	if _, ok := cfg.State("en-proceso"); ok {
+		t.Fatal("State(en-proceso) encontró un estado que la config no declara")
+	}
+	if _, ok := cfg.State(""); ok {
+		t.Fatal("State(\"\") encontró un estado")
+	}
+}
+
+func TestWorkflowTransitionLookup(t *testing.T) {
+	cfg := VentaTemplate()
+
+	transition, ok := cfg.Transition("nuevo", "contactado")
+	if !ok {
+		t.Fatal("Transition(nuevo→contactado) no encontró la transición declarada")
+	}
+	if transition.MinRole != TransitionRoleStaff || !transition.RoundRobin {
+		t.Fatalf("transición = %+v, se esperaba el rol staff y el round-robin", transition)
+	}
+
+	// A pair the config does not declare is not a transition, even if both
+	// states exist: the engine never infers the graph.
+	for _, pair := range [][2]string{
+		{"nuevo", "presupuestado"},
+		{"cerrado", "nuevo"},
+		{"nuevo", "nuevo"},
+		{"no-existe", "contactado"},
+	} {
+		if _, ok := cfg.Transition(pair[0], pair[1]); ok {
+			t.Fatalf("Transition(%s→%s) aceptó un par no declarado", pair[0], pair[1])
+		}
+	}
+}
+
+func TestWorkflowIsTerminal(t *testing.T) {
+	t.Run("venta: the two ends of the pipeline are terminal", func(t *testing.T) {
+		cfg := VentaTemplate()
+		for state, want := range map[string]bool{
+			"nuevo":         false,
+			"contactado":    false,
+			"presupuestado": false,
+			"cerrado":       true,
+			"perdido":       true,
+		} {
+			if got := cfg.IsTerminal(state); got != want {
+				t.Fatalf("IsTerminal(%q) = %t, esperaba %t", state, got, want)
+			}
+		}
+	})
+
+	t.Run("consulta: resuelto is terminal", func(t *testing.T) {
+		cfg := ConsultaTemplate()
+		if !cfg.IsTerminal("resuelto") {
+			t.Fatal("IsTerminal(resuelto) = false en la plantilla 'consulta'")
+		}
+		if cfg.IsTerminal("nuevo") || cfg.IsTerminal("atendido") {
+			t.Fatal("un estado con transiciones salientes no es terminal")
+		}
+	})
+
+	t.Run("fail-closed: a state the config does not declare is terminal", func(t *testing.T) {
+		// An unknown state has no outgoing transition, so nothing accepts
+		// activity on it: the engine treats it as closed instead of guessing
+		// that it is open.
+		if !VentaTemplate().IsTerminal("archivado") {
+			t.Fatal("IsTerminal(estado no declarado) = false, se esperaba fail-closed")
+		}
+		if !VentaTemplate().IsTerminal("") {
+			t.Fatal("IsTerminal(\"\") = false, se esperaba fail-closed")
+		}
+	})
+
+	t.Run("TerminalStates lists them in declaration order", func(t *testing.T) {
+		got := VentaTemplate().TerminalStates()
+		want := []string{"cerrado", "perdido"}
+		if len(got) != len(want) {
+			t.Fatalf("TerminalStates() = %v, esperaba %v", got, want)
+		}
+		for i := range want {
+			if got[i] != want[i] {
+				t.Fatalf("TerminalStates() = %v, esperaba %v", got, want)
+			}
+		}
+
+		resolved := ConsultaTemplate().TerminalStates()
+		if len(resolved) != 1 || resolved[0] != "resuelto" {
+			t.Fatalf("TerminalStates() de consulta = %v, esperaba [resuelto]", resolved)
+		}
+	})
+}
+
+// TestTransitionRoleAuthority pins the ascending authority rule of RF6: a
+// transition declares the LEAST role that may run it, so a role at or above it
+// passes and anything below it — including a client, which is not part of the
+// vocabulary at all — is refused.
+func TestTransitionRoleAuthority(t *testing.T) {
+	cfg := WorkflowConfig{
+		TypeName:     "soporte",
+		InitialState: "nuevo",
+		States:       []StateConfig{{Name: "nuevo"}, {Name: "en-proceso"}, {Name: "escalado"}, {Name: "cerrado"}},
+		Transitions: []TransitionConfig{
+			{From: "nuevo", To: "en-proceso", MinRole: TransitionRoleStaff},
+			{From: "en-proceso", To: "escalado", MinRole: TransitionRoleAdmin},
+			{From: "escalado", To: "cerrado", MinRole: TransitionRoleOwner},
+		},
+	}
+	if err := cfg.Validate(); err != nil {
+		t.Fatalf("config de prueba rechazada: %v", err)
+	}
+
+	staffToProcess, _ := cfg.Transition("nuevo", "en-proceso")
+	adminToEscalate, _ := cfg.Transition("en-proceso", "escalado")
+	ownerToClose, _ := cfg.Transition("escalado", "cerrado")
+
+	cases := []struct {
+		name       string
+		transition TransitionConfig
+		role       TransitionRole
+		want       bool
+	}{
+		{"staff runs a staff transition", staffToProcess, TransitionRoleStaff, true},
+		{"admin runs a staff transition", staffToProcess, TransitionRoleAdmin, true},
+		{"owner runs a staff transition", staffToProcess, TransitionRoleOwner, true},
+		{"staff cannot run an admin transition", adminToEscalate, TransitionRoleStaff, false},
+		{"admin runs an admin transition", adminToEscalate, TransitionRoleAdmin, true},
+		{"owner runs an admin transition", adminToEscalate, TransitionRoleOwner, true},
+		{"admin cannot run an owner transition", ownerToClose, TransitionRoleAdmin, false},
+		{"owner runs an owner transition", ownerToClose, TransitionRoleOwner, true},
+		// A client is not a transition role at all (RF6 criterion: the attempt
+		// is rejected), and neither is an unresolved/forward-compatible value.
+		{"client is not a transition role", staffToProcess, TransitionRole("client"), false},
+		{"empty role is not a transition role", staffToProcess, TransitionRole(""), false},
+		{"unknown role is not a transition role", staffToProcess, TransitionRole("supervisor"), false},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := tc.transition.CanBeExecutedBy(tc.role); got != tc.want {
+				t.Fatalf("CanBeExecutedBy(%q) = %t, esperaba %t", tc.role, got, tc.want)
+			}
+		})
+	}
+}

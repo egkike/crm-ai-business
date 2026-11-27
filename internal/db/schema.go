@@ -65,9 +65,10 @@ const (
 //
 // 'resuelto' is the template's terminal state and 'cerrado' was F1's, so the
 // mapped ticket keeps its meaning: the conversation ended. Nothing else in the
-// product keys on the old value — the note guard travels the closed state as a
-// parameter (dto.TicketNoteAppend.ClosedState), and T3 replaces that fixed
-// vocabulary with the configured one.
+// product keys on the old value — since F2 T3 the note guard and the listing
+// filters derive "open/closed" from the type's configured transitions
+// (internal/repository/tickets.go, ticketIsOpen), with zero state literals in
+// SQL; no dto carries a closed state anymore.
 const (
 	// f1StateClosed is the F1 terminal state, the only F1 value with no
 	// same-name state in the 'consulta' template.

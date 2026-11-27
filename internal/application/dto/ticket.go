@@ -6,69 +6,48 @@ package dto
 // Carriers only — every decision lives in internal/application/usecase and every
 // SQL statement in internal/repository.
 //
-// The two F1 facts the carriers expose — the fixed ticket type and the fixed
-// state vocabulary — are mirrored from the canonical DDL (internal/db) rather
-// than imported from it: the application layer must not depend on the
-// persistence adapter, and a repository test pins both mirrors against the
-// seeded rows, so the duplication cannot drift silently.
+// F2 REPLACED the two fixed facts F1 mirrored here. The ticket type is no longer
+// a constant (the creation names one and the engine loads ITS workflow), and the
+// state vocabulary is no longer an enum: a ticket's states, its transitions, the
+// role each transition requires and the state that ends the conversation are all
+// configuration (domain.WorkflowConfig, RF6). What remains here is therefore the
+// TYPE that carries a configured state name — `TicketState` — and no predicate
+// about which names are legal, because that question has no answer without the
+// ticket's type config.
 
-// TicketState is the state of a ticket.
-//
-// V1/F1 STATE VOCABULARY — F2-REPLACEABLE. F1 has no workflow engine: the states
-// are this fixed three-value vocabulary and `tickets.state` is a free TEXT column
-// with the initial value as its DEFAULT (PRD §3.7). F2 turns states into rows
-// (ticket_states/ticket_transitions) configured per ticket type, at which point
-// this type becomes a carrier of the configured value instead of an enum, the
-// `Valid`/`Open` predicates below become lookups against that configuration, and
-// the workflow engine decides which transitions are legal. Nothing else in this
-// contract depends on the three values.
-type TicketState string
-
+// The ticket types of the shipped seed templates, mirrored from internal/db's
+// seeded rows (db.TicketTypeConsultaID/db.TicketTypeConsultaName). The
+// application layer must not import the persistence adapter, so the values are
+// duplicated and a repository test pins them.
 const (
-	// TicketStateNew is the initial state of every F1 ticket: the contact exists
-	// and nobody has worked it yet.
-	TicketStateNew TicketState = "nuevo"
-
-	// TicketStateAttended is the state of a ticket an internal actor has worked.
-	TicketStateAttended TicketState = "atendido"
-
-	// TicketStateClosed is the state that ends the conversation. A closed ticket
-	// accepts no further notes: RF5 creates a NEW ticket when the client comes
-	// back after the previous one was closed.
-	TicketStateClosed TicketState = "cerrado"
-)
-
-// TicketStateInitial mirrors db.TicketStateInitial (the DEFAULT of
-// tickets.state). A repository test pins the equality.
-const TicketStateInitial = TicketStateNew
-
-// Valid reports whether the state is one the F1 vocabulary knows. An unknown
-// value is a rejected input, never a default.
-func (s TicketState) Valid() bool {
-	return s == TicketStateNew || s == TicketStateAttended || s == TicketStateClosed
-}
-
-// Open reports whether a ticket in this state still accepts activity (notes,
-// re-engagement messages). An invalid state answers false: never treat an
-// unknown state as open.
-func (s TicketState) Open() bool {
-	return s.Valid() && s != TicketStateClosed
-}
-
-// Closed reports whether the state ends the conversation.
-func (s TicketState) Closed() bool {
-	return s == TicketStateClosed
-}
-
-// The single F1 ticket type, mirrored from the seed of migration 2
-// (db.TicketTypeConsultaID/db.TicketTypeConsultaName). F2 turns ticket types into
-// configuration; until then every ticket the product opens is a 'consulta'.
-const (
-	// ConsultaTicketTypeID is the internal UUID of the seeded F1 ticket type.
+	// ConsultaTicketTypeID is the internal UUID of the seeded 'consulta' type.
 	ConsultaTicketTypeID = "00000000-0000-4000-8000-000000000001"
 
-	// ConsultaTicketTypeName is the name of the seeded F1 ticket type.
+	// ConsultaTicketTypeName is the name of the seeded 'consulta' type: the
+	// general contact type, and the type a creation that names none falls back
+	// to (a general consultation, not a fixed pipeline).
 	ConsultaTicketTypeName = "consulta"
+)
+
+// TicketState is the state of a ticket: the NAME of one of the states its type
+// configures. It is a carrier, not an enum — its vocabulary is
+// domain.WorkflowConfig.States, loaded per ticket type, and every question the
+// product asks about a state (is it declared? is it terminal? may this role move
+// the ticket into it?) is answered against that config, never against this type.
+type TicketState string
+
+// The state names the shipped templates declare, as VALUES. They are not a
+// vocabulary: nothing in the product validates a state against this list, and
+// deleting or renaming a state in a type's configuration never touches it. They
+// stay here because the seeded pipelines are named by them everywhere — and
+// because the ceiling fixture of internal/db (an append-only package) writes
+// tickets with these two names.
+const (
+	// TicketStateNew is the initial state of both seed templates.
+	TicketStateNew TicketState = "nuevo"
+
+	// TicketStateAttended is the second state of the 'consulta' template.
+	TicketStateAttended TicketState = "atendido"
 )
 
 // The ticket_events kinds F1 writes. They are open vocabulary on purpose (the
@@ -100,19 +79,39 @@ type TicketRecord struct {
 	// ID is the internal UUID primary key.
 	ID string
 
-	// TicketTypeID is the ticket type of the ticket. F1 always carries
-	// ConsultaTicketTypeID.
+	// TicketTypeID is the internal UUID of the ticket type (the key of its
+	// configuration rows).
 	TicketTypeID string
+
+	// TicketType is the NAME of the ticket type: the key the workflow engine
+	// loads the config by (domain.WorkflowConfigStore.LoadConfig).
+	TicketType string
 
 	// ClientID is the internal UUID of the clients row the ticket belongs to.
 	ClientID string
 
-	// State is the stored state (TicketState vocabulary in F1).
+	// State is the stored state: the name of one state of the type's config.
 	State TicketState
 
 	// AssignedTo is the internal UUID of the accounts row the ticket is
 	// assigned to, or empty when it is in the unassigned pool (RF5).
 	AssignedTo string
+
+	// AreaID is the internal UUID of the area the ticket sits in (RF7): the
+	// type's default area at creation, and the queue the round-robin rule picks
+	// its assignee from (RF6). Empty means the type declares no fixed area
+	// ('consulta': "sin área fija").
+	AreaID string
+
+	// DeadlineAt is the computed deadline of the current state (RF6: "`deadline`
+	// por estado con aviso overdue"): the instant the scheduler compares against.
+	// Empty means the current state declares no deadline.
+	DeadlineAt string
+
+	// ClosedAt is when the ticket reached a terminal state (RF6: terminality is
+	// configuration, so the instant has to be stored). Empty means the
+	// conversation is still open.
+	ClosedAt string
 
 	// CreatedAt and UpdatedAt are the stored ISO-8601 UTC timestamps. UpdatedAt
 	// moves on every activity (transition, note), which is the activity signal
@@ -131,14 +130,25 @@ type NewTicket struct {
 	// ID is the internal UUID primary key, generated by the application layer.
 	ID string
 
-	// TicketTypeID is the ticket type of the ticket (F1: ConsultaTicketTypeID).
-	TicketTypeID string
+	// TicketType is the NAME of the ticket type the ticket belongs to. The
+	// adapter resolves it to the internal id: the engine addresses types by name
+	// (their configuration is keyed by name), and resolving the row here keeps
+	// the internal UUID out of the entity that crosses layers.
+	TicketType string
 
 	// ClientID is the internal UUID of the owning client.
 	ClientID string
 
-	// State is the initial state of the ticket.
+	// State is the initial state of the ticket: the type's configured initial
+	// state (RF5: "queda en el estado inicial del tipo").
 	State TicketState
+
+	// AreaID is the type's default area, or empty when it declares none.
+	AreaID string
+
+	// DeadlineAt is the deadline computed from the initial state's
+	// deadline_hours, or empty when that state declares no deadline.
+	DeadlineAt string
 
 	// OpeningEvent is the audited creation event. Its TicketID is ignored: the
 	// repository writes the event against this ticket's ID.
@@ -211,6 +221,22 @@ type TicketTransition struct {
 	// To is the target state.
 	To TicketState
 
+	// DeadlineAt is the deadline the destination state declares, or empty when
+	// it declares none. The write stores it (and clears the previous one), so
+	// the scheduler compares one stored instant per ticket.
+	DeadlineAt string
+
+	// Closes reports that the destination state is TERMINAL in the type's
+	// configuration. The write stamps closed_at for it (RF6: terminality is
+	// configured, so the instant the conversation ended is stored).
+	Closes bool
+
+	// AssignTo is the accounts row the round-robin rule assigned the ticket to
+	// (RF6: "auto-asignación round-robin del área"), or empty for "leave the
+	// assignment as it is". An area with no members yields an empty value: the
+	// ticket stays in the area's queue and the transition still applies.
+	AssignTo string
+
 	// Event is the audited transition event.
 	Event NewTicketEvent
 }
@@ -220,18 +246,16 @@ type TicketTransition struct {
 //
 // The note travels with its guard for the same reason the transition does: the
 // audit and the activity signal must be written by the same statement group, so
-// a concurrent close cannot let the message land on a closed conversation. There
-// is no From state here on purpose — a note adds activity to an OPEN ticket, and
-// a transition between two open states (nuevo → atendido) must not invalidate it.
-// What the guard refuses is the closed state, which travels as a parameter
-// because the state vocabulary belongs to this layer (F2 turns it into rows).
+// a concurrent close cannot let the message land on a closed conversation.
+//
+// The guard carries NO state vocabulary any more (rider R3-001): whether a state
+// ends the conversation is configuration (domain.WorkflowConfig.IsTerminal), so
+// the adapter derives it from the transitions stored for the ticket's type — the
+// same rule the use case reads from the config, expressed once for SQL instead of
+// travelling here as a fixed value that a migrated ticket could contradict.
 type TicketNoteAppend struct {
 	// TicketID is the internal UUID of the ticket the note belongs to.
 	TicketID string
-
-	// ClosedState is the state the guard refuses (F1: TicketStateClosed). A
-	// ticket in it, or a ticket that does not exist, writes nothing.
-	ClosedState TicketState
 
 	// Event is the audited note event.
 	Event NewTicketEvent
@@ -239,10 +263,13 @@ type TicketNoteAppend struct {
 
 // TicketQuery is the filter of a ticket list.
 //
-// IncludeClosed defaults to false: the list views of F1 are the ACTIVE views, so
-// a closed ticket drops out of the working list unless the caller asks for it
-// explicitly. Limit and Offset arrive already normalized by the application
-// layer (a caller asks for a page, not for a page size).
+// IncludeClosed defaults to false: the list views are the ACTIVE views, so a
+// ticket whose state is terminal drops out of the working list unless the caller
+// asks for it explicitly. "Terminal" is configuration (the states with no
+// outgoing transition), so the filter is derived from the transitions of each
+// ticket's type — never from a fixed state name. Limit and Offset arrive already
+// normalized by the application layer (a caller asks for a page, not for a page
+// size).
 type TicketQuery struct {
 	// ClientID filters the tickets of one client. Empty means "no client
 	// filter" — which the application layer only ever allows for an internal
@@ -280,6 +307,12 @@ type CreateTicketCommand struct {
 	// exists. It is required: RF5's exception is the message with no business
 	// motive (off-topic puro), which must not open a ticket at all.
 	Motive string
+
+	// TicketType is the NAME of the ticket type the contact belongs to, as the
+	// business configures it (RF6). Empty means the general consultation type
+	// (ConsultaTicketTypeName); a name nobody configured is the fail-closed
+	// "no existe un tipo de ticket" rejection, never a silent fallback.
+	TicketType string
 
 	// ClientID is the client the ticket is opened for. It is honored ONLY for an
 	// internal caller opening a ticket on behalf of a client; a client role
@@ -324,8 +357,10 @@ type TransitionCommand struct {
 	// TicketID is the internal UUID of the ticket.
 	TicketID string
 
-	// State is the target state. F1 validates it against the fixed vocabulary;
-	// F2 validates it against the configured transitions of the ticket type.
+	// State is the target state, as a NAME. The vocabulary is the configured one
+	// of the ticket's type, so the wire carries a string and the decision is the
+	// engine's (RF6): a pair the workflow does not declare is rejected, and so is
+	// a transition the caller's role may not execute.
 	State TicketState
 }
 
