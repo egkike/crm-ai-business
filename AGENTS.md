@@ -180,14 +180,18 @@ summary — the native lifecycle owns the mechanics; these rules bind the agent.
    repository policy.
 7. **Every candidate closes with a receipt.** Whenever a review is not run — assess
    `reviewDue: false` (including a doc delta the owner left passive), `unassessable`,
-   a consent decline, or any stop that leaves the candidate in place — the closure
-   procedure applies so no candidate stays open with a warning: `inspect` with the
-   committed-range selector (`baseRef` = the candidate's parent, full 40-char SHA,
-   `committedOnly: true`) → `START` without lenses (the native auto-selects for the
-   tier) → resume via `gentle_review_run` (`lineageId` + the returned base-ref) →
-   receipt burned. An owner disposition decides WHICH candidates get a full review;
-   it does not leave the record open. Apply the closure immediately — a docs edit
-   after the receipt spawns another delta and the cycle repeats.
+   a consent decline, or any stop that leaves the candidate in place — the canonical
+   closure procedure applies so no candidate stays open with a warning: `inspect`
+   with the committed-range selector (`baseRef` = the candidate's parent, full
+   40-char SHA, `committedOnly: true`) → `START` without lenses → acknowledge via
+   the bound facade continuation → receipt burned. The closure is the minimal
+   lifecycle, never a review by choice: a low/`non_executable_only` candidate
+   auto-closes at `START` with ZERO model runs; a medium contract doc carries only
+   the native's own minimum lens (seconds, cost zero — the tier is native-owned,
+   the agent never picks closure lenses). An owner disposition decides WHICH
+   candidates get a full review; it does not leave the record open. Apply the
+   closure immediately — a docs edit after the receipt spawns another delta and
+   the cycle repeats.
 8. **A running verifier blocks the review.** When an independent verifier
    (`gentle-ai-verify`, Risk: item N) applies, it runs FIRST and its verdict is waited
    for before the native assess/review: findings are fixed or dispositioned, and only
