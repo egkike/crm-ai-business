@@ -1,147 +1,54 @@
 package usecase
 
-// ErrorCode identifies an application-level semantic failure. Transports need
-// the code, not the prose, to map a rejection to their own wire contract (T6
-// maps it to a JSON-RPC server error) without parsing strings.
-//
-// The shape mirrors auth.CallerErrorCode on purpose: a transport must be able to
-// treat both packages the same way. When internal/domain lands, both types move
-// there (odd/tasks/backlog.md, "CallerError placement"); until then the code
-// contract is what keeps the mapping from losing information.
-type ErrorCode string
+import "github.com/egkike/crm-ai-business/internal/domain"
 
-// The semantic failures of the anonymous registration seam.
+// The semantic error machinery moved to internal/domain in F2 (the package
+// the AGENTS.md layer map always reserved for it). This file is the
+// compatibility surface every F1 use case already compiles against: the type
+// aliases below are the SAME types, not copies — errors.As and the
+// sanitization boundary in internal/mcp keep matching a single
+// *domain.SemanticError.
+
+// ErrorCode identifies an application-level semantic failure. Alias of
+// domain.ErrorCode (same type, zero migration).
+type ErrorCode = domain.ErrorCode
+
+// SemanticError is the user-facing failure of a business rule. Alias of
+// domain.SemanticError.
+type SemanticError = domain.SemanticError
+
+// The error-code constants, re-exported so the F1 files keep their names.
 const (
-	// CodeInvalidIdentifier: the caller-id cannot be a natural identifier at
-	// all (empty, or longer than any identifier the product stores).
-	CodeInvalidIdentifier ErrorCode = "invalid_identifier"
-	// CodeRegistrationRateLimited: the per-identifier registration budget of
-	// the current window is exhausted (RF3 rate limit).
-	CodeRegistrationRateLimited ErrorCode = "registration_rate_limited"
-	// CodeIdentifierInAccount: the identifier already belongs to an internal
-	// account, so it can never become a client identifier (PRD §3.8 forbids
-	// internal self-registration).
-	CodeIdentifierInAccount ErrorCode = "identifier_in_account"
-	// CodeIdentifierTaken: the identifier already belongs to another client
-	// row and is NOT auto-linked (RF3, fail-closed).
-	CodeIdentifierTaken ErrorCode = "identifier_taken"
+	CodeInvalidIdentifier       = domain.CodeInvalidIdentifier
+	CodeRegistrationRateLimited = domain.CodeRegistrationRateLimited
+	CodeIdentifierInAccount     = domain.CodeIdentifierInAccount
+	CodeIdentifierTaken         = domain.CodeIdentifierTaken
+
+	CodeRoleNotAllowed      = domain.CodeRoleNotAllowed
+	CodeInvalidCatalogKind  = domain.CodeInvalidCatalogKind
+	CodeInvalidCatalogItem  = domain.CodeInvalidCatalogItem
+	CodeCatalogItemNotFound = domain.CodeCatalogItemNotFound
+
+	CodeInvalidTicket      = domain.CodeInvalidTicket
+	CodeInvalidTicketState = domain.CodeInvalidTicketState
+	CodeTicketNotFound     = domain.CodeTicketNotFound
+	CodeTicketClosed       = domain.CodeTicketClosed
+	CodeTicketStateChanged = domain.CodeTicketStateChanged
+	CodeClientNotFound     = domain.CodeClientNotFound
 )
 
-// The semantic failures of the RF4 catalog.
-const (
-	// CodeRoleNotAllowed: the caller's role may not perform this operation. It
-	// is the in-use-case re-assertion of AGENTS.md's double RBAC: the transport
-	// already filtered the tool, and this is the second, independent barrier that
-	// a use case called from another adapter (the panel of F4) still enforces.
-	CodeRoleNotAllowed ErrorCode = "role_not_allowed"
-
-	// CodeInvalidCatalogKind: the kind is outside the RF4 vocabulary
-	// (producto|servicio).
-	CodeInvalidCatalogKind ErrorCode = "invalid_catalog_kind"
-
-	// CodeInvalidCatalogItem: a catalog field violates its rule (empty name,
-	// negative price, duration on a product, oversized text).
-	CodeInvalidCatalogItem ErrorCode = "invalid_catalog_item"
-
-	// CodeCatalogItemNotFound: the update names an id no row carries.
-	CodeCatalogItemNotFound ErrorCode = "catalog_item_not_found"
-)
-
-// The semantic failures of the RF5 tickets.
-const (
-	// CodeInvalidTicket: a ticket input violates its rule (no motive, no note
-	// text, oversized text, no ticket id).
-	CodeInvalidTicket ErrorCode = "invalid_ticket"
-
-	// CodeInvalidTicketState: the requested state is outside the F1 vocabulary,
-	// or it is the state the ticket is already in.
-	CodeInvalidTicketState ErrorCode = "invalid_ticket_state"
-
-	// CodeTicketNotFound: no visible ticket carries that id. It is also the
-	// answer to a client naming someone else's ticket: the rejection does not
-	// confirm that the ticket exists (no oracle).
-	CodeTicketNotFound ErrorCode = "ticket_not_found"
-
-	// CodeTicketClosed: the ticket's conversation is closed, so it accepts no
-	// further notes (RF5: a closed ticket is not re-engagement, it is history).
-	CodeTicketClosed ErrorCode = "ticket_closed"
-
-	// CodeTicketStateChanged: the ticket moved between the read and the write,
-	// so the guarded transition did not apply.
-	CodeTicketStateChanged ErrorCode = "ticket_state_changed"
-
-	// CodeClientNotFound: the ticket names a client no row carries.
-	CodeClientNotFound ErrorCode = "client_not_found"
-)
-
-// SemanticError is the application layer's user-facing failure.
-//
-// Its Message is the only text that may cross the sanitization boundary
-// (AGENTS.md boundary contract 2): Spanish prose addressed to the human on the
-// other side of the channel, with no internals — no paths, no SQL, no wrapped
-// causes. Every other error a use case returns is an internal failure and must
-// collapse to a generic error at the transport boundary.
-type SemanticError struct {
-	code    ErrorCode
-	message string
-}
-
-// Error implements error. It returns the user-facing text so that incidental
-// logging stays semantic; transports branch on Code.
-func (e *SemanticError) Error() string { return e.message }
-
-// Code returns the machine-readable failure class.
-func (e *SemanticError) Code() ErrorCode { return e.code }
-
-// Message returns the Spanish, user-facing text of the failure.
-func (e *SemanticError) Message() string { return e.message }
-
-// newSemanticError builds a semantic failure where the phrasing depends on the
-// offending input (which field, which value). The code carries the
-// machine-readable class, so a transport never parses the prose.
-func newSemanticError(code ErrorCode, message string) error {
-	return &SemanticError{code: code, message: message}
-}
-
-// The sentinel semantic failures of the registration seam. They are returned
-// unwrapped so callers can match with errors.Is and render Message verbatim.
+// The sentinel semantic failures of the registration seam, re-exported as the
+// same values (errors.Is keeps working across the move).
 var (
-	// ErrInvalidIdentifier rejects a caller-id that cannot be a natural
-	// identifier. It is a validation failure, not a registration limit: no
-	// budget is consumed and nothing is written.
-	ErrInvalidIdentifier error = &SemanticError{
-		code:    CodeInvalidIdentifier,
-		message: "el identificador recibido no es válido. Contactá al negocio.",
-	}
-
-	// ErrRateLimited rejects an attempt once the per-identifier budget of the
-	// window is exhausted. The caller is told both ways out: wait, or ask the
-	// business to register them (the operator path always exists).
-	ErrRateLimited error = &SemanticError{
-		code:    CodeRegistrationRateLimited,
-		message: "se superó el límite de intentos de registro. Volvé a intentarlo más tarde o pedile al negocio que te registre.",
-	}
-
-	// ErrIdentifierInAccountPhone rejects a phone that already belongs to an
-	// internal account. The caller is told to ask an administrator: an internal
-	// identifier is never self-registrable (PRD §3.8), so retrying cannot help.
-	ErrIdentifierInAccountPhone error = &SemanticError{
-		code:    CodeIdentifierInAccount,
-		message: "este número ya pertenece a una cuenta del negocio. Contactá al administrador.",
-	}
-
-	// ErrIdentifierInAccountEmail is the e-mail variant of the account
-	// collision: the phrasing names the identifier the sender used.
-	ErrIdentifierInAccountEmail error = &SemanticError{
-		code:    CodeIdentifierInAccount,
-		message: "este email ya pertenece a una cuenta del negocio. Contactá al administrador.",
-	}
-
-	// ErrIdentifierTaken rejects a client-identifier collision. It is the
-	// fail-closed answer of RF3: the attempt is refused, the existing row is
-	// untouched and nothing is auto-linked.
-	ErrIdentifierTaken error = &SemanticError{
-		code:    CodeIdentifierTaken,
-		message: "ya existe un cliente con ese dato. Contactá al negocio.",
-	}
+	ErrInvalidIdentifier        = domain.ErrInvalidIdentifier
+	ErrRateLimited              = domain.ErrRateLimited
+	ErrIdentifierInAccountPhone = domain.ErrIdentifierInAccountPhone
+	ErrIdentifierInAccountEmail = domain.ErrIdentifierInAccountEmail
+	ErrIdentifierTaken          = domain.ErrIdentifierTaken
 )
+
+// newSemanticError phrases a rejection whose text depends on the offending
+// input. It delegates to the single constructor the domain owns.
+func newSemanticError(code ErrorCode, message string) error {
+	return domain.NewSemanticError(code, message)
+}

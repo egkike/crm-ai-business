@@ -128,29 +128,25 @@ const (
 )
 
 // The semantic failures of this file that are shared by more than one use case.
+// They are built with newSemanticError because the struct's fields are owned
+// by internal/domain since F2.
 var (
 	// errTicketIDRequired rejects a call that names no ticket. It is returned
 	// unwrapped so a caller can match it with errors.Is and render Message
 	// verbatim.
-	errTicketIDRequired error = &SemanticError{
-		code:    CodeInvalidTicket,
-		message: "el identificador del ticket es obligatorio.",
-	}
+	errTicketIDRequired error = newSemanticError(CodeInvalidTicket,
+		"el identificador del ticket es obligatorio.")
 
 	// errTicketNotFound rejects a ticket id no visible row carries.
-	errTicketNotFound error = &SemanticError{
-		code:    CodeTicketNotFound,
-		message: "no existe un ticket con ese identificador.",
-	}
+	errTicketNotFound error = newSemanticError(CodeTicketNotFound,
+		"no existe un ticket con ese identificador.")
 
 	// errTicketClosed rejects any activity on a closed conversation. RF5 opens a
 	// new ticket when the client comes back: writing into the closed history
 	// would erase the boundary the re-engagement policy is built on.
-	errTicketClosed error = &SemanticError{
-		code: CodeTicketClosed,
-		message: "el ticket está cerrado: una conversación cerrada no se reabre con una nota. " +
-			"Si el cliente vuelve, se abre un ticket nuevo.",
-	}
+	errTicketClosed error = newSemanticError(CodeTicketClosed,
+		"el ticket está cerrado: una conversación cerrada no se reabre con una nota. "+
+			"Si el cliente vuelve, se abre un ticket nuevo.")
 )
 
 // requireTicketReader re-asserts the permission of the ticket surface every
