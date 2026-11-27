@@ -28,10 +28,14 @@ func mustFail(t *testing.T, handle *sql.DB, want, query string, args ...any) {
 	}
 }
 
-// TestF1SchemaTables pins option B of the phase scope: the seven F1 tables
-// exist and later-phase tables do not, so a phase's schema cannot be created
-// by accident before its own migration (and its own ODD work unit).
-func TestF1SchemaTables(t *testing.T) {
+// TestSchemaTables pins the phase scope of the schema: the F1 and F2 tables
+// exist and later-phase tables do not, so a phase's schema cannot be created by
+// accident before its own migration (and its own ODD work unit).
+//
+// F2 (migration 5) flips the four entries the F1 version of this test asserted
+// absent: areas, ticket_states, ticket_transitions and alerts are the workflow
+// engine's tables and now part of the product.
+func TestSchemaTables(t *testing.T) {
 	handle := openTempDB(t)
 
 	present := []string{
@@ -43,17 +47,22 @@ func TestF1SchemaTables(t *testing.T) {
 		"tickets",
 		"ticket_events",
 		"schema_migrations",
+		// F2 (migration 5): the configurable workflow and the alert queue.
+		"areas",
+		"areas_accounts",
+		"ticket_states",
+		"ticket_transitions",
+		"alerts",
 	}
 	for _, table := range present {
 		if got := queryValue(t, handle,
 			`SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = ?`, table); got != "1" {
-			t.Errorf("falta la tabla %q del alcance F1", table)
+			t.Errorf("falta la tabla %q del alcance F1/F2", table)
 		}
 	}
 
 	absent := []string{
-		"areas", "ticket_states", "ticket_transitions", "schedules", "hours_exceptions",
-		"bookings", "alerts", "sessions",
+		"schedules", "hours_exceptions", "bookings", "sessions",
 	}
 	for _, table := range absent {
 		if got := queryValue(t, handle,
@@ -63,17 +72,35 @@ func TestF1SchemaTables(t *testing.T) {
 	}
 }
 
-// TestTicketTypeSeed pins the single fixed F1 ticket type: one row, the
-// documented identifier and the 'consulta' name.
+// TestTicketTypeSeed pins the seeded ticket types: the fixed F1 'consulta' with
+// its documented identifier, the F2 'venta' template next to it, and their
+// default area (PRD §3.7: 'venta' links the Ventas area, 'consulta' ships "sin
+// área fija": NULL).
 func TestTicketTypeSeed(t *testing.T) {
 	handle := openTempDB(t)
 
 	if got := queryValue(t, handle, `SELECT id FROM ticket_types WHERE name = ?`, TicketTypeConsultaName); got != TicketTypeConsultaID {
 		t.Fatalf("id del tipo %q = %q, se esperaba %q", TicketTypeConsultaName, got, TicketTypeConsultaID)
 	}
-	if got := queryValue(t, handle, `SELECT COUNT(*) FROM ticket_types`); got != "1" {
-		t.Fatalf("tipos de ticket = %s, se esperaba exactamente el fijo de F1", got)
+	if got := queryValue(t, handle, `SELECT id FROM ticket_types WHERE name = ?`, TicketTypeVentaName); got != TicketTypeVentaID {
+		t.Fatalf("id del tipo %q = %q, se esperaba %q", TicketTypeVentaName, got, TicketTypeVentaID)
 	}
+	if got := queryValue(t, handle, `SELECT COUNT(*) FROM ticket_types`); got != "2" {
+		t.Fatalf("tipos de ticket = %s, se esperaban los dos templates seed ('venta' y 'consulta')", got)
+	}
+
+	// PRD §3.7: la plantilla 'venta' declara el área Ventas; la 'consulta' no
+	// tiene área fija, así que su columna queda NULL.
+	if got := queryValue(t, handle, `SELECT default_area_id FROM ticket_types WHERE name = ?`, TicketTypeVentaName); got != AreaVentasID {
+		t.Fatalf("área por defecto de 'venta' = %q, se esperaba el área Ventas %q", got, AreaVentasID)
+	}
+	if got := queryValue(t, handle, `SELECT COUNT(*) FROM ticket_types WHERE name = ? AND default_area_id IS NULL`, TicketTypeConsultaName); got != "1" {
+		t.Fatalf("'consulta' debe quedar sin área fija (default_area_id NULL), count=%s", got)
+	}
+	if got := queryValue(t, handle, `SELECT name FROM areas WHERE id = ?`, AreaVentasID); got != AreaVentasName {
+		t.Fatalf("área sembrada %q = %q, se esperaba %q", AreaVentasID, got, AreaVentasName)
+	}
+
 	// The owner account is NOT seeded: only F4's setup --create-owner creates
 	// internal accounts, so a fresh database has none.
 	if got := queryValue(t, handle, `SELECT COUNT(*) FROM accounts`); got != "0" {

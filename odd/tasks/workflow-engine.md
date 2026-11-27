@@ -103,7 +103,7 @@ Quotes are VERBATIM from docs/PRD.md v1.12 — the RF text is the spec; never pa
 | ID | Specs | Route | Commit |
 |---|---|---|---|
 | T1 | S2, S9 | internal/domain birth: workflow config entities + `Validate` fail-closed + parity tests | 9117c9b (move) + 86cbf8a (workflow) |
-| T2 | S9 | migration v5: `areas`, `ticket_types`, `ticket_states`, `ticket_transitions`, `alerts` + seeds 'venta'/'consulta' | — |
+| T2 | S9 | migration v5: `areas`, `ticket_types`, `ticket_states`, `ticket_transitions`, `alerts` + seeds 'venta'/'consulta' + ports/adapters + riders R3-1/2/3 | 0c863f9 + dbc48c8 |
 | T3 | S1, S2 | engine: creation/transition/deadlines via config, round-robin, events audited, FORBIDDEN por rol | — |
 | T4 | S2, S3 | tools MCP de administración Owner: config de workflows por chat, doble gate destructivas, áreas CRUD | — |
 | T5 | S4 | visibilidad RF8 en listados MCP (staff: propios + no asignados de sus áreas) | — |
@@ -177,3 +177,26 @@ Routes refined with the explorer code map (2026-11-27, evidence path:line):
   `-race` pipeline green + native review). 7 advisory findings, all
   informational, none opened a correction → backlog entries R3-1/R3-2/R3-3
   (Pending riders into T3/T4/T6), R2-001..R2-004 (next-touch/no-action).
+- **L8** (2026-11-27, evidence): T2 landed via delegated writer (gentle-ai-worker,
+  task mwz99jt2-2-isbz) on branch feat/f2-t2-workflow-schema, parent-verified inline
+  (quick pipeline + full `-race` PIPELINE_GREEN, ceiling 66.7s). Commits: 0c863f9
+  (migration v5, internal/db) + dbc48c8 (ports/adapters/riders, domain+repository).
+  Worker's 6 documented DDL deviations reviewed and accepted; one overridden by the
+  parent: `alerts.area_id` born in migration 5 (RF6 verbatim: overdue "para el área
+  asignada"; relaxing a CHECK later = SQLite table rebuild) — CHECK now requires at
+  least one of client/account/area target. 'consulta' conversion: F1 'cerrado' maps
+  to template terminal 'resuelto' (S9/§3.7 pipeline), test migrates a real v4 DB.
+  Rider R2-001 NOT landed (out of the worker's scope, stays backlog). AreaStore has
+  no delete method by design (RF7 'elimina' is the double-gated destructive → T4).
+- **L9** (2026-11-27, evidence): T2 RDD closed. Native assess (baseRef
+  867925651604f8b16d2382b15a547d8d1a963ebb): risk **high**, `reviewDue: true` (agent
+  escalation item 1 — migration rewrites stored state; executable_change doc.go).
+  Native review **review-facf75c0a9cacc06** ran 3 lenses (risk/reliability/resilience) →
+  **approved**, receipt burned. One transport incident: the resilience reviewer's first
+  result was refused at admission (unknown field "evidence"); the slot re-ran cleanly
+  via lineage resume — never the refused bytes. 4 advisory findings (all informational)
+  → backlog: R3-001 **T3 rider (important: post-v5 'cerrado' writes until the engine
+  replaces the vocabulary)**, R3-002 next-touch, R4-001 T4 rider (save must reject
+  dropping in-use states), R4-002 no-action. Independent verifier (gentle-ai-verify,
+  Risk: item 1): 7/7 claims CONFIRMED, **S9: covered**, one cosmetic note on rider
+  label cross-references.
