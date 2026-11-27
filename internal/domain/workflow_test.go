@@ -82,6 +82,73 @@ func TestWorkflowValidateAccepts(t *testing.T) {
 	})
 }
 
+// TestWorkflowDeadlineBoundaries pins the inclusive lower bound and the newly
+// added upper bound of StateConfig.DeadlineHours (rider R3-3 of review
+// 8fc68db721abce52): the boundary values themselves are the contract, and the
+// deadline of one hour was never exercised before.
+func TestWorkflowDeadlineBoundaries(t *testing.T) {
+	withDeadline := func(value int) WorkflowConfig {
+		cfg := validMinimal()
+		cfg.States[0].DeadlineHours = hours(value)
+		return cfg
+	}
+
+	t.Run("una hora se acepta (cota inferior inclusiva)", func(t *testing.T) {
+		if err := withDeadline(1).Validate(); err != nil {
+			t.Fatalf("deadline de una hora rechazado: %v", err)
+		}
+	})
+
+	t.Run("un año se acepta (cota superior inclusiva)", func(t *testing.T) {
+		if err := withDeadline(MaxDeadlineHours).Validate(); err != nil {
+			t.Fatalf("deadline de %d horas rechazado: %v", MaxDeadlineHours, err)
+		}
+	})
+
+	t.Run("una hora por encima del máximo se rechaza", func(t *testing.T) {
+		err := withDeadline(MaxDeadlineHours + 1).Validate()
+		rejectCode(t, err, CodeInvalidWorkflowState)
+
+		var semantic *SemanticError
+		if !errors.As(err, &semantic) {
+			t.Fatalf("esperaba *SemanticError, obtuve %T", err)
+		}
+		// The message names the cap so the Owner can fix the typo without
+		// reading documentation.
+		if !strings.Contains(semantic.Message(), fmt.Sprintf("%d", MaxDeadlineHours)) {
+			t.Fatalf("el mensaje no nombra el máximo de horas: %q", semantic.Message())
+		}
+	})
+}
+
+// TestWorkflowValidateRejectsDefaultArea pins the shape rule of the optional
+// DefaultAreaID (rider R3-2 of review 8fc68db721abce52): a value with
+// surrounding whitespace is rejected before it can reach the save path, where it
+// would fail as an unknown area instead of as the typo it is.
+func TestWorkflowValidateRejectsDefaultArea(t *testing.T) {
+	for name, value := range map[string]string{
+		"espacio al inicio":       " 4f1c2b3a-0000-4000-8000-000000000001",
+		"espacio al final":        "4f1c2b3a-0000-4000-8000-000000000001 ",
+		"solo espacios":           "   ",
+		"tabulador alrededor":     "\t4f1c2b3a-0000-4000-8000-000000000001",
+		"salto de línea al final": "4f1c2b3a-0000-4000-8000-000000000001\n",
+	} {
+		t.Run(name, func(t *testing.T) {
+			cfg := validMinimal()
+			cfg.DefaultAreaID = value
+			rejectCode(t, cfg.Validate(), CodeInvalidWorkflowArea)
+		})
+	}
+
+	t.Run("un id sin espacios alrededor se acepta", func(t *testing.T) {
+		cfg := validMinimal()
+		cfg.DefaultAreaID = "4f1c2b3a-0000-4000-8000-000000000001"
+		if err := cfg.Validate(); err != nil {
+			t.Fatalf("área por defecto válida rechazada: %v", err)
+		}
+	})
+}
+
 func TestWorkflowValidateRejectsName(t *testing.T) {
 	t.Run("empty type name", func(t *testing.T) {
 		cfg := validMinimal()

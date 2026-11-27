@@ -51,7 +51,8 @@ type StateConfig struct {
 
 	// DeadlineHours, when set, is the hours a ticket may sit in this state
 	// before the scheduler emits an overdue alert for the assigned area.
-	// Positive; a missing value means the state has no deadline.
+	// Positive and at most MaxDeadlineHours (one year); a missing value means
+	// the state has no deadline.
 	DeadlineHours *int
 
 	// OnEnterAlert generates a pending alert when a ticket enters this state.
@@ -117,6 +118,17 @@ const (
 
 	// MaxWorkflowTransitions bounds the transitions of one type.
 	MaxWorkflowTransitions = 200
+
+	// MaxDeadlineHours bounds one state deadline: one year (8760 hours).
+	//
+	// A deadline is the hours a ticket may sit in a state before the scheduler
+	// emits an overdue alert (RF6), so an Owner writes it through a conversation
+	// or a form — and an astronomical value is a typo, not a rule: the scheduler
+	// would then never fire the alert it was asked to emit, turning a configured
+	// deadline that cannot expire into a silent failure instead of a rejected
+	// config (fail-closed, rider R3-1 of review 8fc68db721abce52). The bound is
+	// inclusive on both ends: 1 hour is valid, 8760 is valid, 8761 is rejected.
+	MaxDeadlineHours = 8760
 )
 
 // The workflow validation classes. They are the machine-readable contract a
@@ -138,15 +150,22 @@ const (
 	// destination, undeclared state, self-loop, duplicated pair, invalid
 	// role, over the cap).
 	CodeInvalidWorkflowTransition ErrorCode = "invalid_workflow_transition"
+
+	// CodeInvalidWorkflowArea: the optional default area id violates its shape
+	// rule (a non-empty value with surrounding whitespace).
+	CodeInvalidWorkflowArea ErrorCode = "invalid_workflow_area"
 )
 
 // Validate checks the whole config and rejects it with a semantic error if
-// any rule is violated. Rules run in a fixed order (name, states, initial,
-// transitions) so the first rejection is deterministic; every rule rejects
-// before anything is persisted, which is what "rechaza la config completa y
-// nada queda parcialmente escrito" requires.
+// any rule is violated. Rules run in a fixed order (name, default area, states,
+// initial, transitions) so the first rejection is deterministic; every rule
+// rejects before anything is persisted, which is what "rechaza la config
+// completa y nada queda parcialmente escrito" requires.
 func (c WorkflowConfig) Validate() error {
 	if err := c.validateName(); err != nil {
+		return err
+	}
+	if err := c.validateDefaultArea(); err != nil {
 		return err
 	}
 	stateIndex, err := c.validateStates()
@@ -172,6 +191,27 @@ func (c WorkflowConfig) validateName() error {
 	if len([]rune(c.TypeName)) > MaxWorkflowNameLen {
 		return NewSemanticError(CodeInvalidWorkflowName, fmt.Sprintf(
 			"el nombre del tipo de ticket supera el máximo de %d caracteres.", MaxWorkflowNameLen))
+	}
+	return nil
+}
+
+// validateDefaultArea enforces the shape rule of the optional default area id
+// (RF7: "cada tipo de ticket declara su área por defecto").
+//
+// The rule is deliberately shape-only (rider R3-2 of review 8fc68db721abce52):
+// an id with surrounding whitespace is a copy-paste accident that would fail
+// later as "área inexistente" at save time, so it is rejected here with the
+// message that names the real problem. Whether the area row EXISTS is not a
+// domain question — the domain never knows row ids — it is the save-time
+// invariant of the application layer, which owns the repository ports. An empty
+// value is the documented "no fixed area" of the 'consulta' template.
+func (c WorkflowConfig) validateDefaultArea() error {
+	if c.DefaultAreaID == "" {
+		return nil
+	}
+	if strings.TrimSpace(c.DefaultAreaID) != c.DefaultAreaID {
+		return NewSemanticError(CodeInvalidWorkflowArea,
+			"el área por defecto del workflow no puede empezar ni terminar con espacios.")
 	}
 	return nil
 }
@@ -209,6 +249,14 @@ func (c WorkflowConfig) validateStates() (map[string]bool, error) {
 		if state.DeadlineHours != nil && *state.DeadlineHours < 1 {
 			return nil, NewSemanticError(CodeInvalidWorkflowState, fmt.Sprintf(
 				"el deadline del estado '%s' debe ser de al menos una hora.", state.Name))
+		}
+		// The upper bound is the fail-closed half of the deadline rule: a
+		// deadline that cannot expire within a year is a typo, and letting it
+		// through would configure a notification that never fires.
+		if state.DeadlineHours != nil && *state.DeadlineHours > MaxDeadlineHours {
+			return nil, NewSemanticError(CodeInvalidWorkflowState, fmt.Sprintf(
+				"el deadline del estado '%s' supera el máximo de %d horas (un año).",
+				state.Name, MaxDeadlineHours))
 		}
 		index[state.Name] = true
 	}
